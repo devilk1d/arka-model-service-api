@@ -56,9 +56,13 @@ N_TOPICS     = N["n_topics"]
 
 ANALYZER     = SentimentIntensityAnalyzer()
 
-OLLAMA_URL   = os.getenv("OLLAMA_URL", "https://api.ollama.ai/v1")
+_raw_url     = os.getenv("OLLAMA_URL", "https://api.openai.com/v1")
+# Normalise: ensure scheme, strip trailing slash
+if not _raw_url.startswith("http"):
+    _raw_url = f"https://{_raw_url}"
+OLLAMA_URL   = _raw_url.rstrip("/")
 OLLAMA_KEY   = os.getenv("OLLAMA_API_KEY", "")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:397b-cloud")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-4o-mini")
 FUSION_ALPHA = float(os.getenv("FUSION_ALPHA", "0.8"))  # weight for tabular model
 
 print("✅ Both artifacts loaded")
@@ -511,24 +515,72 @@ Maksimal 150 kata total."""
 
 
 async def call_qwen(prompt: str) -> str:
-    headers = {
-        "Authorization": f"Bearer {OLLAMA_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model":    OLLAMA_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream":   False,
-        "options":  {"temperature": 0.3, "num_predict": 350},
-    }
+    """
+    Call an OpenAI-compatible chat API (Ollama, OpenRouter, Together, OpenAI, etc.)
+    Supports two payload formats:
+      - OpenAI / OpenRouter / Together:  top-level max_tokens + temperature
+      - Native Ollama (/api/chat):       options.{temperature, num_predict}
+    Auto-detects Ollama by checking if OLLAMA_URL contains 'localhost' or
+    the path ends with /api, and falls back to /api/chat in that case.
+    """
+    is_native_ollama = (
+        "localhost" in OLLAMA_URL
+        or "127.0.0.1" in OLLAMA_URL
+        or OLLAMA_URL.rstrip("/").endswith("/api")
+    )
+
+    headers = {"Content-Type": "application/json"}
+    if OLLAMA_KEY:
+        headers["Authorization"] = f"Bearer {OLLAMA_KEY}"
+
+    if is_native_ollama:
+        # Native Ollama format → POST /api/chat
+        endpoint = OLLAMA_URL.rstrip("/")
+        if not endpoint.endswith("/api/chat"):
+            # strip /v1 if present, append /api/chat
+            endpoint = endpoint.replace("/v1", "").rstrip("/") + "/api/chat"
+        payload = {
+            "model":    OLLAMA_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream":   False,
+            "options":  {"temperature": 0.3, "num_predict": 350},
+        }
+    else:
+        # OpenAI-compatible format → POST /chat/completions
+        endpoint = f"{OLLAMA_URL}/chat/completions"
+        payload = {
+            "model":       OLLAMA_MODEL,
+            "messages":    [{"role": "user", "content": prompt}],
+            "max_tokens":  400,
+            "temperature": 0.3,
+        }
+
     try:
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            resp = await client.post(f"{OLLAMA_URL}/chat/completions",
-                                     headers=headers, json=payload)
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(endpoint, headers=headers, json=payload)
             resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"].strip()
+            data = resp.json()
+
+        # Parse response — handle both OpenAI and native Ollama shapes
+        if "choices" in data:
+            # OpenAI-compatible shape
+            content = data["choices"][0]["message"]["content"]
+        elif "message" in data:
+            # Native Ollama shape
+            content = data["message"]["content"]
+        else:
+            return f"[XAI unavailable: unexpected response shape: {list(data.keys())}]"
+
+        # Strip <think>…</think> blocks some Qwen models emit
+        content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+        return content
+
+    except httpx.ConnectError as e:
+        return f"[XAI unavailable: cannot connect to {endpoint} — {str(e)[:120]}]"
+    except httpx.HTTPStatusError as e:
+        return f"[XAI unavailable: HTTP {e.response.status_code} from {endpoint}]"
     except Exception as e:
-        return f"[XAI unavailable: {str(e)[:100]}]"
+        return f"[XAI unavailable: {type(e).__name__}: {str(e)[:120]}]"
 
 
 # ─── Endpoints ─────────────────────────────────────────────────────────────────
