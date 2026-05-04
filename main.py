@@ -56,13 +56,9 @@ N_TOPICS     = N["n_topics"]
 
 ANALYZER     = SentimentIntensityAnalyzer()
 
-_raw_url     = os.getenv("OLLAMA_URL", "https://api.openai.com/v1")
-# Normalise: ensure scheme, strip trailing slash
-if not _raw_url.startswith("http"):
-    _raw_url = f"https://{_raw_url}"
-OLLAMA_URL   = _raw_url.rstrip("/")
+OLLAMA_URL   = os.getenv("OLLAMA_URL", "https://api.ollama.ai/v1")
 OLLAMA_KEY   = os.getenv("OLLAMA_API_KEY", "")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-4o-mini")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:397b-cloud")
 FUSION_ALPHA = float(os.getenv("FUSION_ALPHA", "0.8"))  # weight for tabular model
 
 print("✅ Both artifacts loaded")
@@ -406,7 +402,7 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
 def build_churn_xai_prompt(r: dict) -> str:
     """
     Prompt untuk Churn Prediction XAI.
-    Menggabungkan: churn score + SHAP factors + sentiment analysis + urgency.
+    Output: strict JSON dengan 4 field terstruktur.
     """
     shap_lines = "\n".join([
         f"  {idx+1}. {f['feature_label']} "
@@ -416,51 +412,47 @@ def build_churn_xai_prompt(r: dict) -> str:
     ])
     sent = r["sentiment"]
     actions = r["segment_actions"]
-    retain_opts  = ", ".join(actions.get("retain", []))
-    offer_opts   = ", ".join(actions.get("offer", []))
+    retain_opts = actions.get("retain", [])
+    offer_opts  = actions.get("offer", [])
 
-    return f"""Anda adalah analis customer success senior. Tulis analisis dalam Bahasa Indonesia yang jelas dan actionable.
+    return f"""Anda adalah analis customer success senior. Balas HANYA dengan JSON valid, tanpa teks lain, tanpa markdown, tanpa komentar.
 
-═══ DATA CUSTOMER ═══
-ID          : {r['customer_id']}
-Plan        : {r['plan_type']} ({r['contract_type']})
-Churn Score : {r['churn_score']}/100  →  Risk Level: {r['risk_level']}
-Tabular Model Probability : {r['tabular_proba']*100:.1f}%
-NLP Model Probability     : {r['nlp_proba']*100:.1f}%
+DATA CUSTOMER:
+ID: {r['customer_id']} | Plan: {r['plan_type']} ({r['contract_type']}) | Churn Score: {r['churn_score']}/100 | Risk: {r['risk_level']}
+ML Probability: {r['tabular_proba']*100:.1f}% | NLP Probability: {r['nlp_proba']*100:.1f}%
 
-═══ FAKTOR UTAMA DARI MODEL ML (SHAP) ═══
+FAKTOR SHAP:
 {shap_lines}
 
-═══ ANALISIS SENTIMEN FEEDBACK ═══
-Sentimen keseluruhan : {sent['label'].upper()} (VADER: {sent['vader_compound']:+.3f})
-Negatif per kalimat  : {sent['pct_negative_sent']:.1f}% kalimat bernada negatif
-Urgency level        : {sent['urgency_level'].upper()} (score: {sent['urgency_score']})
-Topik utama feedback : {sent['dominant_topic']} (strength: {sent['topic_strength']:.2f})
-Preview feedback     : "{sent['feedback_preview'][:200]}"
+SENTIMEN:
+Label: {sent['label'].upper()} | VADER: {sent['vader_compound']:+.3f} | Negatif: {sent['pct_negative_sent']:.1f}%
+Urgency: {sent['urgency_level'].upper()} (score: {sent['urgency_score']}) | Topik: {sent['dominant_topic']}
+Preview: "{sent['feedback_preview'][:150]}"
 
-═══ TULIS ANALISIS DALAM FORMAT INI ═══
+OPSI RETENSI: {retain_opts}
+OPSI PENAWARAN: {offer_opts}
 
-**MENGAPA CHURN SCORE {r['churn_score']}/100?**
-[2-3 kalimat: jelaskan kombinasi faktor model + sentimen yang menghasilkan score ini]
-
-**FAKTOR RISIKO UTAMA**
-[3 poin singkat, masing-masing 1 kalimat, langsung dari data SHAP di atas]
-
-**SINYAL DARI FEEDBACK PELANGGAN**
-[1-2 kalimat: apa yang dikatakan feedback mereka, hubungkan dengan sentimen dan topik]
-
-**REKOMENDASI TINDAKAN**
-Pilih 1 dari retain: [{retain_opts}]
-Pilih 1 dari offer : [{offer_opts}]
-[1 kalimat: tindakan spesifik yang paling tepat dan alasannya]
-
-Maksimal 150 kata total. Langsung ke poin, tanpa pembuka."""
+Balas dengan JSON persis seperti struktur ini (isi dalam bahasa Indonesia, singkat dan actionable):
+{{
+  "score_reason": "2-3 kalimat menjelaskan mengapa churn score setinggi ini berdasarkan kombinasi ML + NLP + sentimen",
+  "risk_factors": [
+    "1 kalimat faktor risiko #1 langsung dari SHAP",
+    "1 kalimat faktor risiko #2 langsung dari SHAP",
+    "1 kalimat faktor risiko #3 langsung dari SHAP"
+  ],
+  "feedback_signal": "1-2 kalimat tentang apa yang tersirat dari feedback dan sentimen pelanggan",
+  "action": {{
+    "retain": "nama aksi retensi yang dipilih dari opsi",
+    "offer": "nama penawaran yang dipilih dari opsi",
+    "reason": "1 kalimat alasan mengapa kombinasi ini paling tepat untuk pelanggan ini"
+  }}
+}}"""
 
 
 def build_segment_xai_prompt(r: dict) -> str:
     """
     Prompt untuk Customer Segmentation XAI.
-    Menggabungkan: RFM values vs segment average + NLP topic + sentiment.
+    Output: strict JSON dengan 4 field terstruktur.
     """
     rfm = r["segment_rfm_context"]
     sent = r["sentiment"]
@@ -468,65 +460,52 @@ def build_segment_xai_prompt(r: dict) -> str:
     seg_act  = r["segment_actions"]
 
     rfm_lines = "\n".join([
-        f"  {k.replace('_',' ').title():25s}: {v['customer']:>8.1f}  (rata-rata segment: {v['segment_avg']:.1f})"
+        f"  {k.replace('_',' ').title()}: customer={v['customer']:.1f}, segment_avg={v['segment_avg']:.1f}"
         for k, v in rfm.items()
     ])
 
-    return f"""Anda adalah analis customer success senior. Tulis analisis dalam Bahasa Indonesia.
+    return f"""Anda adalah analis customer success senior. Balas HANYA dengan JSON valid, tanpa teks lain, tanpa markdown, tanpa komentar.
 
-═══ PROFIL CUSTOMER ═══
-ID          : {r['customer_id']}
-Plan        : {r['plan_type']} ({r['contract_type']})
-Segment     : {r['segment_label']}
-Churn Score : {r['churn_score']}/100
+PROFIL CUSTOMER:
+ID: {r['customer_id']} | Plan: {r['plan_type']} ({r['contract_type']})
+Segment: {r['segment_label']} | Churn Score: {r['churn_score']}/100
 
-═══ NILAI RFM CUSTOMER vs RATA-RATA SEGMENTNYA ═══
-{"Metrik":<25}  {"Customer":>8}  {"Avg Segment":>12}
+NILAI RFM vs RATA-RATA SEGMENT:
 {rfm_lines}
 
-═══ PROFIL SEGMENT ═══
-Jumlah customer  : {seg_prof.get('count', 'N/A')}
-Avg churn score  : {seg_prof.get('avg_churn_score', 'N/A')}/100
-% High risk      : {seg_prof.get('pct_high_risk', 'N/A')}%
-Avg revenue      : {seg_prof.get('avg_revenue', 'N/A')}
-Deskripsi        : {seg_act.get('description', '')}
-Prioritas        : {seg_act.get('priority', '')}
+PROFIL SEGMENT:
+Jumlah customer: {seg_prof.get('count','N/A')} | Avg churn score: {seg_prof.get('avg_churn_score','N/A')}/100
+% High risk: {seg_prof.get('pct_high_risk','N/A')}% | Deskripsi: {seg_act.get('description','')}
 
-═══ SENTIMEN & TOPIK FEEDBACK ═══
-Sentimen    : {sent['label']} ({sent['vader_compound']:+.3f})
-Topik utama : {sent['dominant_topic']}
-Urgency     : {sent['urgency_level']}
+SENTIMEN: {sent['label']} (VADER: {sent['vader_compound']:+.3f}) | Topik: {sent['dominant_topic']} | Urgency: {sent['urgency_level']}
 
-═══ TULIS ANALISIS DALAM FORMAT INI ═══
-
-**MENGAPA MASUK SEGMENT "{r['segment_label']}"?**
-[2-3 kalimat: jelaskan kombinasi nilai RFM yang menempatkan customer ini di segment ini vs customer lain]
-
-**KARAKTERISTIK DIBANDING SEGMENT RATA-RATA**
-[2-3 poin: di mana customer ini lebih tinggi atau lebih rendah dari rata-rata segmentnya, dan apa artinya]
-
-**APA YANG PERLU DIPERHATIKAN**
-[1-2 kalimat: insight khusus dari kombinasi segment + sentimen + topik feedback]
-
-**STRATEGI UNTUK SEGMENT INI**
-[1-2 kalimat: pendekatan yang tepat untuk customer di segment ini secara umum]
-
-Maksimal 150 kata total."""
+Balas dengan JSON persis seperti struktur ini (isi dalam bahasa Indonesia):
+{{
+  "segment_reason": "2-3 kalimat mengapa customer masuk segment ini berdasarkan nilai RFM",
+  "characteristics": [
+    "1 kalimat perbedaan customer vs rata-rata segment #1",
+    "1 kalimat perbedaan customer vs rata-rata segment #2",
+    "1 kalimat perbedaan customer vs rata-rata segment #3"
+  ],
+  "watch_out": "1-2 kalimat insight khusus dari kombinasi segment + sentimen + topik",
+  "strategy": "1-2 kalimat pendekatan terbaik untuk customer di segment ini"
+}}"""
 
 
 async def call_qwen(prompt: str) -> str:
     """
-    Call an OpenAI-compatible chat API (Ollama, OpenRouter, Together, OpenAI, etc.)
-    Supports two payload formats:
-      - OpenAI / OpenRouter / Together:  top-level max_tokens + temperature
-      - Native Ollama (/api/chat):       options.{temperature, num_predict}
-    Auto-detects Ollama by checking if OLLAMA_URL contains 'localhost' or
-    the path ends with /api, and falls back to /api/chat in that case.
+    Call OpenAI-compatible chat API. Returns raw string (JSON or error message).
+    Supports both native Ollama (/api/chat) and OpenAI-compatible (/chat/completions).
     """
+    _raw_url = os.getenv("OLLAMA_URL", "https://api.openai.com/v1")
+    if not _raw_url.startswith("http"):
+        _raw_url = f"https://{_raw_url}"
+    base_url = _raw_url.rstrip("/")
+
     is_native_ollama = (
-        "localhost" in OLLAMA_URL
-        or "127.0.0.1" in OLLAMA_URL
-        or OLLAMA_URL.rstrip("/").endswith("/api")
+        "localhost" in base_url
+        or "127.0.0.1" in base_url
+        or base_url.rstrip("/").endswith("/api")
     )
 
     headers = {"Content-Type": "application/json"}
@@ -534,25 +513,22 @@ async def call_qwen(prompt: str) -> str:
         headers["Authorization"] = f"Bearer {OLLAMA_KEY}"
 
     if is_native_ollama:
-        # Native Ollama format → POST /api/chat
-        endpoint = OLLAMA_URL.rstrip("/")
-        if not endpoint.endswith("/api/chat"):
-            # strip /v1 if present, append /api/chat
-            endpoint = endpoint.replace("/v1", "").rstrip("/") + "/api/chat"
+        endpoint = base_url.replace("/v1", "").rstrip("/") + "/api/chat"
         payload = {
             "model":    OLLAMA_MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "stream":   False,
-            "options":  {"temperature": 0.3, "num_predict": 350},
+            "format":   "json",
+            "options":  {"temperature": 0.2, "num_predict": 500},
         }
     else:
-        # OpenAI-compatible format → POST /chat/completions
-        endpoint = f"{OLLAMA_URL}/chat/completions"
+        endpoint = f"{base_url}/chat/completions"
         payload = {
             "model":       OLLAMA_MODEL,
             "messages":    [{"role": "user", "content": prompt}],
-            "max_tokens":  400,
-            "temperature": 0.3,
+            "max_tokens":  600,
+            "temperature": 0.2,
+            "response_format": {"type": "json_object"},
         }
 
     try:
@@ -561,26 +537,25 @@ async def call_qwen(prompt: str) -> str:
             resp.raise_for_status()
             data = resp.json()
 
-        # Parse response — handle both OpenAI and native Ollama shapes
         if "choices" in data:
-            # OpenAI-compatible shape
             content = data["choices"][0]["message"]["content"]
         elif "message" in data:
-            # Native Ollama shape
             content = data["message"]["content"]
         else:
-            return f"[XAI unavailable: unexpected response shape: {list(data.keys())}]"
+            return json.dumps({"error": f"unexpected response shape: {list(data.keys())}"})
 
-        # Strip <think>…</think> blocks some Qwen models emit
+        # Strip <think>...</think> blocks emitted by some Qwen models
         content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+        # Strip markdown code fences if model wraps JSON in ```
+        content = re.sub(r"^```(?:json)?\s*", "", content).rstrip("```").strip()
         return content
 
     except httpx.ConnectError as e:
-        return f"[XAI unavailable: cannot connect to {endpoint} — {str(e)[:120]}]"
+        return json.dumps({"error": f"cannot connect to {endpoint}: {str(e)[:100]}"})
     except httpx.HTTPStatusError as e:
-        return f"[XAI unavailable: HTTP {e.response.status_code} from {endpoint}]"
+        return json.dumps({"error": f"HTTP {e.response.status_code} from {endpoint}"})
     except Exception as e:
-        return f"[XAI unavailable: {type(e).__name__}: {str(e)[:120]}]"
+        return json.dumps({"error": f"{type(e).__name__}: {str(e)[:100]}"})
 
 
 # ─── Endpoints ─────────────────────────────────────────────────────────────────
