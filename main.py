@@ -231,11 +231,7 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     # FIX #2: KMEANS.n_clusters konsisten dengan artifact (tidak hardcode k=5 atau k=4)
     seg_raw = master[SEG_FEATURES].copy()
     for c in SEG_FEATURES:
-        # v2.2 fix for predict_single: if median is nan (batch of 1 with missing data),
-        # fill with 0 so SCALER and KMEANS don't crash.
-        m = seg_raw[c].median()
-        if pd.isna(m): m = 0.0
-        seg_raw[c] = seg_raw[c].fillna(m)
+        seg_raw[c] = seg_raw[c].fillna(seg_raw[c].median())
     X_seg = SCALER_SEG.transform(seg_raw.values)
     master["segment_cluster"] = KMEANS.predict(X_seg)
     master["segment_label"]   = master["segment_cluster"].map(LABEL_MAP)
@@ -302,10 +298,9 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
 
     for c in ["urgency_score","vader_compound","vader_neg","pct_negative_sent","vader_min_sent","avg_words_per_sent"]:
         master[c] = master[c].fillna(0)
-    master["sentiment_label"]      = master["sentiment_label"].fillna("No Feedback Available")
-    master["urgency_level"]        = master["urgency_level"].fillna("Low")
+    master["sentiment_label"]      = master["sentiment_label"].fillna("unknown")
+    master["urgency_level"]        = master["urgency_level"].fillna("low")
     master["dominant_topic_label"] = master["dominant_topic_label"].fillna("No Feedback")
-    master["all_feedback"]         = master["all_feedback"].fillna("Customer doesn't have any feedback")
 
     tab_proba   = np.nan_to_num(tab_proba, nan=0.0)
     fused_score = (tab_proba * 100).round(1)
@@ -321,12 +316,7 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     centroids_raw = SCALER_SEG.inverse_transform(KMEANS.cluster_centers_)
     centroid_df   = pd.DataFrame(centroids_raw, columns=SEG_FEATURES)
 
-    # Fill remaining NaNs: numeric columns with 0, object/string columns with empty string or their previous defaults
-    master  = master.replace([np.inf, -np.inf], np.nan)
-    num_cols = master.select_dtypes(include=[np.number]).columns
-    master[num_cols] = master[num_cols].fillna(0)
-    master  = master.fillna("") # fill remaining string NaNs with empty string
-    
+    master  = master.replace([np.inf, -np.inf], np.nan).fillna(0)
     shap_df = shap_df.replace([np.inf, -np.inf], np.nan).fillna(0)
 
     results = []
