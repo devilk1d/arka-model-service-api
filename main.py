@@ -174,10 +174,15 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
         med = master.groupby("segment_cluster")[col].transform("median")
         master[col] = master[col].fillna(med).fillna(master[col].median())
     master["has_nps_data"] = master["has_nps_data"].fillna(0).astype(int)
-    for col in ["total_tickets","open_tickets","billing_tickets","technical_tickets",
-                "critical_tickets","high_tickets","unresolved_ratio","critical_ratio",
-                "avg_payment_delay","max_payment_delay"]:
-        master[col] = master[col].fillna(0)
+    
+    fill_0_cols = ["total_tickets","open_tickets","billing_tickets","technical_tickets",
+                   "critical_tickets","high_tickets","unresolved_ratio","critical_ratio",
+                   "avg_payment_delay","max_payment_delay"]
+    master[fill_0_cols] = master[fill_0_cols].fillna(0)
+    
+    # Fill remaining NaNs in numeric columns to avoid issues with transforms/prediction
+    numeric_cols = master.select_dtypes(include=[np.number]).columns
+    master[numeric_cols] = master[numeric_cols].fillna(0)
 
     # ── Encode + transforms ──────────────────────────────────────────────────
     master["plan_enc"]     = LE_PLAN.transform(master["plan_type"])
@@ -234,10 +239,18 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
         (master["vader_compound"] < -0.2) & (master["urgency_score"] >= 1)
     ).astype(int)
 
+    # Robust probability handling
+    tab_proba   = np.nan_to_num(tab_proba, nan=0.0)
     fused_score = (tab_proba * 100).round(1)
+    fused_score = np.nan_to_num(fused_score, nan=0.0)
 
     centroids_raw = SCALER_SEG.inverse_transform(KMEANS.cluster_centers_)
     centroid_df   = pd.DataFrame(centroids_raw, columns=SEG_FEATURES)
+    
+    # ── Final cleanup for JSON compliance ────────────────────────────────────
+    # Replace NaN and Inf with 0 in master and shap_df to prevent JSON serialization errors
+    master  = master.replace([np.inf, -np.inf], np.nan).fillna(0)
+    shap_df = shap_df.replace([np.inf, -np.inf], np.nan).fillna(0)
 
     results = []
     for i in range(len(master)):
