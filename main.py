@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # ─── App ──────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Churn Prediction API", version="2.1.0")
+app = FastAPI(title="Churn Prediction API", version="2.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,7 +21,7 @@ app.add_middleware(
 )
 
 # ─── Load artifacts ───────────────────────────────────────────────────────────
-# v2.1: single artifact file — tidak ada lagi nlp_artifacts_v1.pkl
+# v2.2: single artifact file — churn_artifacts_v2.pkl
 print("Loading artifacts...")
 A = joblib.load(os.getenv("ARTIFACTS_PATH", "churn_artifacts_v2.pkl"))
 
@@ -32,9 +32,10 @@ LE_CONTRACT  = A["le_contract"]
 SCALER_SEG   = A["scaler_seg"]
 KMEANS       = A["kmeans"]
 LABEL_MAP    = A["cluster_label_map"]
+# FIX #3: baca SEG_FEATURES dari artifact — sudah include log_revenue & log_usage
 SEG_FEATURES = A["seg_features"]
 SEG_PROFILES = A["segment_profiles"]
-SEG_DESCS    = A["segment_descriptions"]   # deskripsi konteks — bukan opsi hardcoded
+SEG_DESCS    = A["segment_descriptions"]
 RISK_LOW     = A["risk_thresholds"]["low"]
 RISK_HIGH    = A["risk_thresholds"]["high"]
 REF          = pd.Timestamp(A["reference_date"])
@@ -52,7 +53,56 @@ OLLAMA_URL   = os.getenv("OLLAMA_URL", "https://api.openai.com/v1")
 OLLAMA_KEY   = os.getenv("OLLAMA_API_KEY", "")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-4o-mini")
 
+# ─── FIX #4: Plan-aware action options untuk Qwen ────────────────────────────
+# Setiap plan punya opsi retain & offer yang sesuai dengan nilai dan kebutuhan mereka.
+# Qwen tetap bebas memilih dan menyesuaikan — ini adalah panduan, bukan batasan.
+PLAN_ACTIONS = {
+    "Enterprise": {
+        "retain": [
+            "Jadwalkan Executive Business Review dengan C-level",
+            "Assign dedicated Customer Success Manager",
+            "Sesi strategy call dengan tim product",
+            "Audit menyeluruh penggunaan platform oleh tim teknis",
+        ],
+        "offer": [
+            "Perpanjang kontrak dengan harga terkunci (price lock 2 tahun)",
+            "Upgrade gratis ke tier tertinggi selama 1 kuartal",
+            "Diskon 25-30% untuk renewal tahunan",
+            "SLA premium + prioritas dukungan 24/7",
+        ],
+    },
+    "Professional": {
+        "retain": [
+            "Jadwalkan video call dengan Customer Success specialist",
+            "Sesi onboarding lanjutan + feature training",
+            "Kirim email personal dari Account Manager",
+            "Undangan ke webinar eksklusif + komunitas pengguna",
+        ],
+        "offer": [
+            "Diskon 20% untuk 3 bulan ke depan",
+            "Upgrade gratis ke Enterprise selama 2 bulan",
+            "Tambahan kursi pengguna gratis selama 3 bulan",
+            "Free month dengan komitmen renewal tahunan",
+        ],
+    },
+    "Starter": {
+        "retain": [
+            "Kirim onboarding email series yang dipersonalisasi",
+            "Undangan ke sesi live demo & Q&A",
+            "Hubungi via chat — tawarkan panduan setup 1-on-1",
+            "Kirim success story dari customer dengan profil serupa",
+        ],
+        "offer": [
+            "1 bulan gratis tanpa syarat",
+            "Upgrade ke Professional dengan harga Starter selama 3 bulan",
+            "Diskon 30% untuk 2 bulan + akses fitur premium",
+            "Perpanjang trial fitur advanced gratis 30 hari",
+        ],
+    },
+}
+
 print(f"Artifacts loaded | model v{A.get('model_version','?')} | "
+      f"k={KMEANS.n_clusters} clusters | SEG_FEATURES={SEG_FEATURES} | "
       f"RISK_LOW={RISK_LOW} | RISK_HIGH={RISK_HIGH}")
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -101,13 +151,20 @@ def compute_vader_features(text: str) -> dict:
 def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     """
     Full production pipeline — tabular LightGBM + NLP XAI/flag.
-    No late fusion, no NLP model. Sinkron dengan notebook v2.1.
+    v2.2 fixes:
+      - FIX #1: log-transform total_revenue & monthly_usage_hrs sebelum clustering
+      - FIX #2: k sinkron dengan notebook (dibaca dari artifact KMEANS.n_clusters)
+      - FIX #3: SEG_FEATURES dibaca dari artifact (sudah include log features)
+      - FIX #5: normalisasi plan_type casing di awal pipeline
     """
-    # ── Clean ────────────────────────────────────────────────────────────────
+    # ── FIX #5: Normalisasi casing plan_type & contract_type ─────────────────
+    # Menangani mixed case (starter / Starter / STARTER) di semua inference paths
     ca_df = ca_df.copy()
     ca_df["plan_type"]     = ca_df["plan_type"].str.capitalize().str.strip()
     ca_df["contract_type"] = ca_df["contract_type"].str.capitalize().str.strip()
-    nps_df["nps_score"]    = nps_df["nps_score"].clip(lower=0)
+    nps_df = nps_df.copy()
+    nps_df["nps_score"] = nps_df["nps_score"].clip(lower=0)
+
     for df, cols in [
         (ca_df,  ["subscription_date", "unsubscribed_date"]),
         (bd_df,  ["billing_date", "payment_date"]),
@@ -162,9 +219,19 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
         .merge(nf, on="customer_id", how="left")
     )
 
-    # ── Segmentation (before imputation) ────────────────────────────────────
+    # ── FIX #1: Log-transform sebelum segmentasi ──────────────────────────────
+    # total_revenue (r=0.67 vs plan) dan monthly_usage_hrs (r=0.79 vs plan) sangat
+    # skewed. Tanpa log-transform, KMeans didominasi oleh skala revenue Enterprise
+    # sehingga clustering hanya memisahkan plan tier, bukan behaviour.
+    master["log_revenue"] = np.log1p(master["total_revenue"].fillna(0))
+    master["log_usage"]   = np.log1p(master["monthly_usage_hrs"].fillna(0))
+
+    # ── Segmentation (sebelum imputation) ─────────────────────────────────────
+    # SEG_FEATURES dibaca dari artifact — sudah menggunakan log_revenue & log_usage
+    # FIX #2: KMEANS.n_clusters konsisten dengan artifact (tidak hardcode k=5 atau k=4)
     seg_raw = master[SEG_FEATURES].copy()
-    for c in SEG_FEATURES: seg_raw[c] = seg_raw[c].fillna(seg_raw[c].median())
+    for c in SEG_FEATURES:
+        seg_raw[c] = seg_raw[c].fillna(seg_raw[c].median())
     X_seg = SCALER_SEG.transform(seg_raw.values)
     master["segment_cluster"] = KMEANS.predict(X_seg)
     master["segment_label"]   = master["segment_cluster"].map(LABEL_MAP)
@@ -174,13 +241,13 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
         med = master.groupby("segment_cluster")[col].transform("median")
         master[col] = master[col].fillna(med).fillna(master[col].median())
     master["has_nps_data"] = master["has_nps_data"].fillna(0).astype(int)
-    
+
     fill_0_cols = ["total_tickets","open_tickets","billing_tickets","technical_tickets",
                    "critical_tickets","high_tickets","unresolved_ratio","critical_ratio",
                    "avg_payment_delay","max_payment_delay"]
     master[fill_0_cols] = master[fill_0_cols].fillna(0)
-    
-    # Fill remaining NaNs in numeric columns to avoid issues with transforms/prediction
+
+    # Fill remaining NaNs in numeric columns
     numeric_cols = master.select_dtypes(include=[np.number]).columns
     master[numeric_cols] = master[numeric_cols].fillna(0)
 
@@ -195,8 +262,8 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     master["adoption_x_usage"]    = master["feature_adoption_pct"] * master["log_monthly_usage_hrs"]
     master["nps_x_dunning"]       = master["avg_nps_score"]       * (master["dunning_count"] + 1)
 
-    # ── Tabular prediction (LightGBM only — no fusion) ───────────────────────
-    master = master.reset_index(drop=True)   # FIX: reset index sebelum predict
+    # ── Tabular prediction (LightGBM only) ───────────────────────────────────
+    master = master.reset_index(drop=True)
     X_tab     = master[FEATURES].values
     tab_proba = MODEL.predict_proba(X_tab)[:, 1]
     shap_vals = EXPLAINER.shap_values(master[FEATURES])
@@ -208,7 +275,6 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
         lambda x: " | ".join(x.dropna().astype(str))
     ).reset_index(); text_per.columns = ["customer_id","all_feedback"]
 
-    # Vectorized VADER (bukan iterrows)
     nlp_feats_series = text_per["all_feedback"].apply(compute_vader_features)
     nlp_df = pd.DataFrame(list(nlp_feats_series))
     nlp_df["customer_id"] = text_per["customer_id"].values
@@ -235,22 +301,21 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     master["sentiment_label"]      = master["sentiment_label"].fillna("unknown")
     master["urgency_level"]        = master["urgency_level"].fillna("low")
     master["dominant_topic_label"] = master["dominant_topic_label"].fillna("No Feedback")
-    # Robust probability handling
+
     tab_proba   = np.nan_to_num(tab_proba, nan=0.0)
     fused_score = (tab_proba * 100).round(1)
     fused_score = np.nan_to_num(fused_score, nan=0.0)
 
-    # nlp_red_flag only if model is "safe" (<= RISK_HIGH) but NLP is negative
     master["nlp_red_flag"] = (
         (fused_score <= RISK_HIGH) &
         (master["vader_compound"] < -0.2) & (master["urgency_score"] >= 1)
     ).astype(int)
 
+    # FIX #1: centroid di-inverse dari SEG_FEATURES yang sudah include log features
+    # sehingga tampilan RFM context di UI konsisten dengan apa yang dipakai clustering
     centroids_raw = SCALER_SEG.inverse_transform(KMEANS.cluster_centers_)
     centroid_df   = pd.DataFrame(centroids_raw, columns=SEG_FEATURES)
-    
-    # ── Final cleanup for JSON compliance ────────────────────────────────────
-    # Replace NaN and Inf with 0 in master and shap_df to prevent JSON serialization errors
+
     master  = master.replace([np.inf, -np.inf], np.nan).fillna(0)
     shap_df = shap_df.replace([np.inf, -np.inf], np.nan).fillna(0)
 
@@ -264,20 +329,32 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
         seg_prof = next((p for p in SEG_PROFILES if p["segment_label"] == seg), {})
         centroid = centroid_df.iloc[seg_cl].to_dict()
 
-        seg_rfm_context = {
-            "days_since_login":     {"customer": round(float(row.get("days_since_login",0)),1),
-                                     "segment_avg": round(centroid["days_since_login"],1)},
-            "payment_count":        {"customer": round(float(row.get("payment_count",0)),1),
-                                     "segment_avg": round(centroid["payment_count"],1)},
-            "total_revenue":        {"customer": round(float(row.get("total_revenue",0)),1),
-                                     "segment_avg": round(centroid["total_revenue"],1)},
-            "monthly_usage_hrs":    {"customer": round(float(row.get("monthly_usage_hrs",0)),1),
-                                     "segment_avg": round(centroid["monthly_usage_hrs"],1)},
-            "feature_adoption_pct": {"customer": round(float(row.get("feature_adoption_pct",0)),1),
-                                     "segment_avg": round(centroid["feature_adoption_pct"],1)},
-            "avg_nps_score":        {"customer": round(float(row.get("avg_nps_score",0)),2),
-                                     "segment_avg": round(centroid["avg_nps_score"],2)},
+        # RFM context menggunakan nama feature yang aktual di SEG_FEATURES
+        # Untuk display di UI, tampilkan label yang readable terlepas dari nama internal
+        seg_rfm_context = {}
+        rfm_display_map = {
+            "days_since_login": "days_since_login",
+            "payment_count":    "payment_count",
+            "log_revenue":      "total_revenue",   # tampilkan sebagai total_revenue di UI
+            "total_revenue":    "total_revenue",
+            "log_usage":        "monthly_usage_hrs",
+            "monthly_usage_hrs":"monthly_usage_hrs",
+            "feature_adoption_pct": "feature_adoption_pct",
+            "avg_nps_score":    "avg_nps_score",
         }
+        for feat, centroid_val in centroid.items():
+            display_key = rfm_display_map.get(feat, feat)
+            # Untuk log features, tampilkan nilai original (exp - 1) agar UI lebih readable
+            if feat == "log_revenue":
+                cust_val = round(float(np.expm1(row.get(feat, 0))), 1)
+                seg_avg  = round(float(np.expm1(centroid_val)), 1)
+            elif feat == "log_usage":
+                cust_val = round(float(np.expm1(row.get(feat, 0))), 1)
+                seg_avg  = round(float(np.expm1(centroid_val)), 1)
+            else:
+                cust_val = round(float(row.get(feat, 0)), 2 if "nps" in feat else 1)
+                seg_avg  = round(float(centroid_val), 2 if "nps" in feat else 1)
+            seg_rfm_context[display_key] = {"customer": cust_val, "segment_avg": seg_avg}
 
         results.append({
             "customer_id":          row["customer_id"],
@@ -286,7 +363,7 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
             "churn_score":          score_val,
             "churn_proba":          round(float(tab_proba[i]), 4),
             "tabular_proba":        round(float(tab_proba[i]), 4),
-            "nlp_proba":            None,   # tidak ada late fusion
+            "nlp_proba":            None,
             "risk_level":           risk_val,
             "shap_top5":            get_top_shap(shap_df.iloc[i], top_n=5),
             "nlp_red_flag":         int(row["nlp_red_flag"]),
@@ -306,7 +383,6 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
             "segment_rfm_context":  seg_rfm_context,
             "segment_profile":      seg_prof,
             "segment_description":  SEG_DESCS.get(seg, ""),
-            # segment_actions dihapus — Qwen generate per customer
         })
 
     return results
@@ -316,8 +392,8 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
 def build_churn_xai_prompt(r: dict) -> str:
     """
     Prompt untuk XAI churn prediction.
-    v2.1: Qwen menentukan sendiri rekomendasi retain & offer per customer —
-    tidak ada opsi hardcoded. AI bebas generate berdasarkan data individu.
+    v2.2: Qwen mendapat opsi retain & offer yang disesuaikan dengan plan customer
+    (FIX #4) sehingga rekomendasi lebih kontekstual dan tidak mismatch plan.
     """
     shap_lines = "\n".join([
         f"  {idx+1}. {f['feature_label']} "
@@ -326,9 +402,19 @@ def build_churn_xai_prompt(r: dict) -> str:
         for idx, f in enumerate(r["shap_top5"])
     ])
     sent = r["sentiment"]
-    # nlp_proba adalah None di v2.1 — tampilkan hanya tabular proba
-    ml_prob_str = f"{r['tabular_proba']*100:.1f}%"
+    ml_prob_str  = f"{r['tabular_proba']*100:.1f}%"
     red_flag_str = " [NLP RED FLAG - feedback sangat negatif]" if r.get("nlp_red_flag") else ""
+
+    # FIX #4: ambil opsi plan-aware, fallback ke Professional jika plan tidak dikenal
+    plan_key     = r["plan_type"] if r["plan_type"] in PLAN_ACTIONS else "Professional"
+    plan_opts    = PLAN_ACTIONS[plan_key]
+    retain_opts  = plan_opts["retain"]
+    offer_opts   = plan_opts["offer"]
+
+    rfm_lines = "\n".join([
+        f"  {k.replace('_',' ').title()}: customer={v['customer']}, avg={v['segment_avg']}"
+        for k, v in r["segment_rfm_context"].items()
+    ])
 
     return f"""Anda adalah analis customer success senior yang berpengalaman. Balas HANYA dengan JSON valid, tanpa teks lain, tanpa markdown, tanpa komentar.
 
@@ -347,10 +433,16 @@ Preview: "{sent['feedback_preview'][:200]}"
 PROFIL SEGMEN: {r.get('segment_description', '')}
 
 KONTEKS RFM vs RATA-RATA SEGMEN:
-{chr(10).join([f"  {k.replace('_',' ').title()}: customer={v['customer']}, avg={v['segment_avg']}" for k,v in r['segment_rfm_context'].items()])}
+{rfm_lines}
 
-Berdasarkan SELURUH data di atas, tentukan tindakan retensi dan penawaran yang PALING TEPAT untuk customer INI secara spesifik.
-Gunakan judgment kamu sebagai analis — tidak ada opsi yang dibatasi.
+OPSI RETENSI (pilih atau adaptasi yang paling sesuai untuk plan {r['plan_type']}):
+{chr(10).join(f'  - {o}' for o in retain_opts)}
+
+OPSI PENAWARAN (pilih atau adaptasi yang paling sesuai untuk plan {r['plan_type']}):
+{chr(10).join(f'  - {o}' for o in offer_opts)}
+
+Berdasarkan SELURUH data di atas, pilih atau adaptasi tindakan yang PALING TEPAT untuk customer INI secara spesifik.
+Pertimbangkan plan type, churn score, SHAP factors, dan sentimen feedback.
 
 Balas dengan JSON persis seperti ini (dalam bahasa Indonesia, singkat dan actionable):
 {{
@@ -362,15 +454,15 @@ Balas dengan JSON persis seperti ini (dalam bahasa Indonesia, singkat dan action
   ],
   "feedback_signal": "1-2 kalimat apa yang tersirat dari feedback dan perilaku customer ini",
   "action": {{
-    "retain": "tindakan retensi terbaik untuk customer INI (contoh: jadwalkan video call dengan CS lead, kirim email personal dari CEO, tawarkan dedicated account manager, dll)",
-    "offer": "penawaran terbaik untuk customer INI (contoh: diskon 30% 6 bulan, upgrade gratis 3 bulan, onboarding ulang gratis, perpanjang kontrak dengan harga dikunci, dll)",
-    "reason": "1 kalimat mengapa kombinasi ini paling tepat untuk profil customer ini secara spesifik"
+    "retain": "tindakan retensi terbaik untuk customer INI (boleh adaptasi dari opsi di atas)",
+    "offer": "penawaran terbaik untuk customer INI (boleh adaptasi dari opsi di atas)",
+    "reason": "1 kalimat mengapa kombinasi ini paling tepat untuk profil customer ini"
   }}
 }}"""
 
 
 def build_segment_xai_prompt(r: dict) -> str:
-    """Prompt untuk XAI segmentasi customer."""
+    """Prompt untuk XAI segmentasi customer. v2.2: tidak ada perubahan struktur."""
     rfm = r["segment_rfm_context"]
     sent = r["sentiment"]
     seg_prof = r["segment_profile"]
@@ -468,11 +560,13 @@ async def call_qwen(prompt: str) -> str:
 # ─── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    # FIX v2.1: tidak ada lagi reference ke N (nlp_artifacts)
     return {
-        "status":        "ok",
-        "model_version": A.get("model_version", "v2.1"),
-        "nlp_role":      A.get("nlp_role", "xai_context_and_flag"),
+        "status":          "ok",
+        "model_version":   A.get("model_version", "v2.1"),
+        "pipeline_version": "v2.2",
+        "nlp_role":        A.get("nlp_role", "xai_context_and_flag"),
+        "seg_features":    SEG_FEATURES,
+        "n_clusters":      int(KMEANS.n_clusters),
         "risk_thresholds": {"low": RISK_LOW, "high": RISK_HIGH},
     }
 
