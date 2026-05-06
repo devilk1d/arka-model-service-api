@@ -6,15 +6,13 @@ import numpy as np
 import joblib
 import shap
 import httpx
-from scipy.sparse import hstack, csr_matrix
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sklearn.preprocessing import StandardScaler
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # ─── App ──────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Churn Prediction API", version="2.0.0")
+app = FastAPI(title="Churn Prediction API", version="2.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,10 +21,10 @@ app.add_middleware(
 )
 
 # ─── Load artifacts ───────────────────────────────────────────────────────────
+# v2.1: single artifact file — tidak ada lagi nlp_artifacts_v1.pkl
 print("Loading artifacts...")
+A = joblib.load(os.getenv("ARTIFACTS_PATH", "churn_artifacts_v2.pkl"))
 
-# Notebook 1: churn_pipeline_v3 artifacts
-A = joblib.load(os.getenv("ARTIFACTS_PATH", "churn_artifacts_v1.pkl"))
 MODEL        = A["model"]
 FEATURES     = A["production_features"]
 LE_PLAN      = A["le_plan"]
@@ -36,32 +34,26 @@ KMEANS       = A["kmeans"]
 LABEL_MAP    = A["cluster_label_map"]
 SEG_FEATURES = A["seg_features"]
 SEG_PROFILES = A["segment_profiles"]
-SEG_ACTIONS  = A["segment_actions"]
+SEG_DESCS    = A["segment_descriptions"]   # deskripsi konteks — bukan opsi hardcoded
 RISK_LOW     = A["risk_thresholds"]["low"]
 RISK_HIGH    = A["risk_thresholds"]["high"]
 REF          = pd.Timestamp(A["reference_date"])
 EXPLAINER    = shap.TreeExplainer(MODEL)
 
-# Notebook 2: nlp_pipeline_complete artifacts
-N = joblib.load(os.getenv("NLP_ARTIFACTS_PATH", "nlp_artifacts_v1.pkl"))
-TFIDF        = N["tfidf"]
-LDA          = N["lda"]
-CV_VEC       = N["cv_vec"]
-NLP_LR       = N["nlp_lr"]
-SCALER_NLP   = N["scaler_nlp"]
-TOPIC_NAMES  = N["topic_names"]
-URGENCY_LEX  = N["urgency_lexicon"]
-EXTRA_COLS   = N["extra_cols"]
-N_TOPICS     = N["n_topics"]
+# NLP artifacts — untuk XAI context & risk flag saja (bukan model input)
+CV_VEC       = A["cv_vec"]
+LDA          = A["lda"]
+TOPIC_NAMES  = A["topic_names"]
+URGENCY_LEX  = A["urgency_lexicon"]
 
 ANALYZER     = SentimentIntensityAnalyzer()
 
-OLLAMA_URL   = os.getenv("OLLAMA_URL", "https://api.ollama.ai/v1")
+OLLAMA_URL   = os.getenv("OLLAMA_URL", "https://api.openai.com/v1")
 OLLAMA_KEY   = os.getenv("OLLAMA_API_KEY", "")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:397b-cloud")
-FUSION_ALPHA = float(os.getenv("FUSION_ALPHA", "0.8"))  # weight for tabular model
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-4o-mini")
 
-print("✅ Both artifacts loaded")
+print(f"Artifacts loaded | model v{A.get('model_version','?')} | "
+      f"RISK_LOW={RISK_LOW} | RISK_HIGH={RISK_HIGH}")
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 def risk_level(score: float) -> str:
@@ -71,135 +63,47 @@ def get_top_shap(shap_row: pd.Series, top_n: int = 5) -> list:
     top = shap_row.abs().nlargest(top_n)
     return [
         {
-            "feature":     k,
-            "shap_value":  round(float(shap_row[k]), 4),
-            "direction":   "increases_churn" if shap_row[k] > 0 else "decreases_churn",
-            "importance":  round(abs(float(shap_row[k])), 4),
+            "feature":       k,
+            "shap_value":    round(float(shap_row[k]), 4),
+            "direction":     "increases_churn" if shap_row[k] > 0 else "decreases_churn",
+            "importance":    round(abs(float(shap_row[k])), 4),
             "feature_label": k.replace("_", " ").title(),
         }
         for k in top.index
     ]
 
-# ─── NLP pipeline ─────────────────────────────────────────────────────────────
-def compute_nlp_features(text_df: pd.DataFrame) -> dict:
+def compute_vader_features(text: str) -> dict:
     """
-    Run full NLP pipeline on per-customer aggregated text.
-    Returns dict of arrays, one value per customer row.
+    Hitung VADER multi-level per customer.
+    avg_words_per_sent dihitung dengan benar (FIX dari approx np.zeros).
     """
-    texts = text_df["all_feedback"].fillna("").tolist()
-
-    # VADER document level
-    vader_results = [ANALYZER.polarity_scores(str(t)) for t in texts]
-    vader_compound   = np.array([r["compound"] for r in vader_results])
-    vader_pos        = np.array([r["pos"]      for r in vader_results])
-    vader_neg        = np.array([r["neg"]      for r in vader_results])
-    vader_neu        = np.array([r["neu"]      for r in vader_results])
-
-    # VADER sentence level
-    def sent_vader(text):
-        sentences = re.split(r"[.!?|]+", str(text))
-        scores = [ANALYZER.polarity_scores(s.strip())["compound"]
-                  for s in sentences if len(s.strip()) > 10]
-        if not scores:
-            return 0.0, 0.0, 0.0, 0.0
-        return (min(scores), float(np.std(scores)),
-                sum(1 for s in scores if s < -0.05) / len(scores),
-                max(scores) - min(scores))
-
-    sent_stats = [sent_vader(t) for t in texts]
-    vader_min_sent     = np.array([s[0] for s in sent_stats])
-    vader_std_sent     = np.array([s[1] for s in sent_stats])
-    pct_negative_sent  = np.array([s[2] for s in sent_stats])
-    vader_range        = np.array([s[3] for s in sent_stats])
-
-    # Urgency score
-    urgency_score = np.array([
-        sum(1 for w in URGENCY_LEX if w in str(t).lower()) for t in texts
-    ])
-
-    # Sentiment label
-    sentiment_labels = [
-        "positive" if c >= 0.05 else ("negative" if c <= -0.05 else "neutral")
-        for c in vader_compound
-    ]
-    urgency_levels = [
-        "high" if u >= 3 else ("medium" if u >= 1 else "low")
-        for u in urgency_score
-    ]
-
-    # LDA topics
-    X_counts = CV_VEC.transform(texts)
-    X_topics = LDA.transform(X_counts)
-    dominant_topic      = X_topics.argmax(axis=1)
-    dominant_topic_score = X_topics.max(axis=1)
-    dominant_topic_label = [TOPIC_NAMES[i] for i in dominant_topic]
-
+    if not text or (isinstance(text, float) and pd.isna(text)):
+        return {k: 0.0 for k in ["vader_compound","vader_pos","vader_neg","vader_neu",
+                                   "vader_min_sent","vader_std_sent","pct_negative_sent",
+                                   "vader_range","urgency_score","avg_words_per_sent"]}
+    doc   = ANALYZER.polarity_scores(str(text))
+    sents = [s.strip() for s in re.split(r"[.!?|]+", str(text)) if len(s.strip()) > 10]
+    sc    = [ANALYZER.polarity_scores(s)["compound"] for s in sents] if sents else [0.0]
     return {
-        "vader_compound":        vader_compound,
-        "vader_pos":             vader_pos,
-        "vader_neg":             vader_neg,
-        "vader_neu":             vader_neu,
-        "vader_min_sent":        vader_min_sent,
-        "vader_std_sent":        vader_std_sent,
-        "pct_negative_sent":     pct_negative_sent,
-        "vader_range":           vader_range,
-        "urgency_score":         urgency_score,
-        "urgency_level":         urgency_levels,
-        "sentiment_label":       sentiment_labels,
-        "dominant_topic":        dominant_topic,
-        "dominant_topic_label":  dominant_topic_label,
-        "dominant_topic_score":  dominant_topic_score,
-        "topic_distribution":    X_topics,  # shape (n_customers, 8)
+        "vader_compound":     doc["compound"],
+        "vader_pos":          doc["pos"],
+        "vader_neg":          doc["neg"],
+        "vader_neu":          doc["neu"],
+        "vader_min_sent":     min(sc),
+        "vader_std_sent":     float(np.std(sc)),
+        "pct_negative_sent":  sum(1 for s in sc if s < -0.05) / len(sc),
+        "vader_range":        max(sc) - min(sc),
+        "urgency_score":      sum(1 for w in URGENCY_LEX if w in str(text).lower()),
+        "avg_words_per_sent": float(np.mean([len(s.split()) for s in sents])) if sents else 0.0,
     }
-
-
-def compute_nlp_proba(text_df: pd.DataFrame, nlp_feats: dict) -> np.ndarray:
-    """Compute NLP model churn probability using the trained NLP LR."""
-    texts = text_df["all_feedback"].fillna("").tolist()
-    CAT_COLS = ["Account", "Billing", "Feature Request", "General", "Onboarding", "Technical"]
-
-    # Reconstruct extra features in same order as training
-    n = len(texts)
-    extra = pd.DataFrame({
-        "vader_compound":      nlp_feats["vader_compound"],
-        "vader_pos":           nlp_feats["vader_pos"],
-        "vader_neg":           nlp_feats["vader_neg"],
-        "vader_neu":           nlp_feats["vader_neu"],
-        "vader_min_sent":      nlp_feats["vader_min_sent"],
-        "vader_std_sent":      nlp_feats["vader_std_sent"],
-        "pct_negative_sent":   nlp_feats["pct_negative_sent"],
-        "vader_range":         nlp_feats["vader_range"],
-        "text_length":         text_df["all_feedback"].str.len().fillna(0).values,
-        "word_count":          text_df["all_feedback"].str.split().str.len().fillna(0).values,
-        "exclaim_count":       text_df["all_feedback"].str.count("!").fillna(0).values,
-        "question_count":      text_df["all_feedback"].str.count(r"\?").fillna(0).values,
-        "urgency_score":       nlp_feats["urgency_score"],
-        "avg_words_per_sent":  np.zeros(n),  # approx
-        "avg_nps_score":       text_df.get("avg_nps_score", pd.Series(np.zeros(n))).fillna(0).values,
-        "min_nps_score":       text_df.get("min_nps_score", pd.Series(np.zeros(n))).fillna(0).values,
-        "n_surveys":           text_df.get("n_surveys",     pd.Series(np.ones(n))).fillna(1).values,
-        "pct_detractor":       text_df.get("pct_detractor", pd.Series(np.zeros(n))).fillna(0).values,
-        "n_categories":        text_df.get("n_categories",  pd.Series(np.ones(n))).fillna(1).values,
-    })
-    for c in CAT_COLS:
-        extra[c] = text_df.get(c, pd.Series(np.zeros(n))).fillna(0).values
-    topic_df = pd.DataFrame(nlp_feats["topic_distribution"],
-                            columns=[f"topic_{i}" for i in range(N_TOPICS)])
-    extra = pd.concat([extra, topic_df.reset_index(drop=True)], axis=1)
-
-    X_tfidf = TFIDF.transform(texts)
-    X_extra = csr_matrix(SCALER_NLP.transform(extra.fillna(0).values))
-    X_full  = hstack([X_tfidf, X_extra])
-    return NLP_LR.predict_proba(X_full)[:, 1]
-
 
 # ─── Core pipeline ─────────────────────────────────────────────────────────────
 def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     """
-    Full pipeline combining both notebooks.
-    Returns list of per-customer result dicts.
+    Full production pipeline — tabular LightGBM + NLP XAI/flag.
+    No late fusion, no NLP model. Sinkron dengan notebook v2.1.
     """
-    # Clean
+    # ── Clean ────────────────────────────────────────────────────────────────
     ca_df = ca_df.copy()
     ca_df["plan_type"]     = ca_df["plan_type"].str.capitalize().str.strip()
     ca_df["contract_type"] = ca_df["contract_type"].str.capitalize().str.strip()
@@ -218,7 +122,7 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
         ca_df["unsubscribed_date"].fillna(REF) - ca_df["subscription_date"]
     ).dt.days.clip(lower=1)
 
-    # Feature engineering
+    # ── Feature engineering ────────────────────────────────────────────────
     payments = bd_df[bd_df["record_type"] == "payment"].copy()
     payments["delay_days"] = (payments["payment_date"] - payments["billing_date"]).dt.days
     bf = payments.groupby("customer_id").agg(
@@ -244,42 +148,28 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     tf["unresolved_ratio"] = tf["open_tickets"]    / tf["total_tickets"].replace(0,1)
     tf["critical_ratio"]   = tf["critical_tickets"] / tf["total_tickets"].replace(0,1)
 
-    # NPS tabular
     nf = nps_df.groupby("customer_id").agg(
         avg_nps_score=("nps_score","mean"), min_nps_score=("nps_score","min"),
         survey_count=("survey_id","count"),
         pct_detractor=("segment",lambda x:(x=="detractor").mean()),
     ).reset_index(); nf["has_nps_data"] = 1
 
-    # NPS NLP features per customer
-    CAT_COLS = ["Account","Billing","Feature Request","General","Onboarding","Technical"]
-    cat_dummies = pd.get_dummies(nps_df["feedback_category"])
-    for c in CAT_COLS:
-        if c not in cat_dummies.columns: cat_dummies[c] = 0
-    cat_dummies["customer_id"] = nps_df["customer_id"]
-    cat_per = cat_dummies.groupby("customer_id")[CAT_COLS].sum().reset_index()
-
-    text_per = nps_df.groupby("customer_id")["feedback_text"].apply(
-        lambda x: " | ".join(x.dropna().astype(str))
-    ).reset_index(); text_per.columns = ["customer_id","all_feedback"]
-
-    # Master merge
     master = ca_df[["customer_id","plan_type","contract_type","total_users","tenure_days"]].copy()
     master = (master
-        .merge(uf,       on="customer_id", how="left")
-        .merge(bf,       on="customer_id", how="left")
-        .merge(tf,       on="customer_id", how="left")
-        .merge(nf,       on="customer_id", how="left")
+        .merge(uf, on="customer_id", how="left")
+        .merge(bf, on="customer_id", how="left")
+        .merge(tf, on="customer_id", how="left")
+        .merge(nf, on="customer_id", how="left")
     )
 
-    # Segmentation (before imputation)
+    # ── Segmentation (before imputation) ────────────────────────────────────
     seg_raw = master[SEG_FEATURES].copy()
     for c in SEG_FEATURES: seg_raw[c] = seg_raw[c].fillna(seg_raw[c].median())
     X_seg = SCALER_SEG.transform(seg_raw.values)
     master["segment_cluster"] = KMEANS.predict(X_seg)
     master["segment_label"]   = master["segment_cluster"].map(LABEL_MAP)
 
-    # NPS cluster imputation
+    # ── Imputation ────────────────────────────────────────────────────────────
     for col in ["avg_nps_score","min_nps_score","survey_count","pct_detractor"]:
         med = master.groupby("segment_cluster")[col].transform("median")
         master[col] = master[col].fillna(med).fillna(master[col].median())
@@ -289,6 +179,7 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
                 "avg_payment_delay","max_payment_delay"]:
         master[col] = master[col].fillna(0)
 
+    # ── Encode + transforms ──────────────────────────────────────────────────
     master["plan_enc"]     = LE_PLAN.transform(master["plan_type"])
     master["contract_enc"] = LE_CONTRACT.transform(master["contract_type"])
     for col in ["total_users","monthly_usage_hrs","total_revenue","total_tickets"]:
@@ -299,110 +190,119 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     master["adoption_x_usage"]    = master["feature_adoption_pct"] * master["log_monthly_usage_hrs"]
     master["nps_x_dunning"]       = master["avg_nps_score"]       * (master["dunning_count"] + 1)
 
-    # Tabular prediction
-    X_tab       = master[FEATURES].values
-    tab_proba   = MODEL.predict_proba(X_tab)[:, 1]
-    shap_vals   = EXPLAINER.shap_values(master[FEATURES])
+    # ── Tabular prediction (LightGBM only — no fusion) ───────────────────────
+    master = master.reset_index(drop=True)   # FIX: reset index sebelum predict
+    X_tab     = master[FEATURES].values
+    tab_proba = MODEL.predict_proba(X_tab)[:, 1]
+    shap_vals = EXPLAINER.shap_values(master[FEATURES])
     if isinstance(shap_vals, list): shap_vals = shap_vals[1]
     shap_df = pd.DataFrame(shap_vals, columns=FEATURES)
 
-    # NLP pipeline
-    nlp_input = master[["customer_id"]].copy()
-    nlp_input = nlp_input.merge(text_per,   on="customer_id", how="left")
-    nlp_input = nlp_input.merge(cat_per,    on="customer_id", how="left")
-    nlp_input = nlp_input.merge(
-        master[["customer_id","avg_nps_score","min_nps_score","survey_count","pct_detractor"]],
-        on="customer_id", how="left"
-    )
-    nlp_input["all_feedback"] = nlp_input["all_feedback"].fillna("")
-    nlp_input[CAT_COLS]       = nlp_input[CAT_COLS].fillna(0)
-    nlp_input["n_categories"] = (nlp_input[CAT_COLS] > 0).sum(axis=1)
-    nlp_input["n_surveys"]    = master["survey_count"].values
+    # ── NLP pipeline — XAI context & risk flag only ──────────────────────────
+    text_per = nps_df.groupby("customer_id")["feedback_text"].apply(
+        lambda x: " | ".join(x.dropna().astype(str))
+    ).reset_index(); text_per.columns = ["customer_id","all_feedback"]
 
-    nlp_feats = compute_nlp_features(nlp_input)
-    nlp_proba = compute_nlp_proba(nlp_input, nlp_feats)
+    # Vectorized VADER (bukan iterrows)
+    nlp_feats_series = text_per["all_feedback"].apply(compute_vader_features)
+    nlp_df = pd.DataFrame(list(nlp_feats_series))
+    nlp_df["customer_id"] = text_per["customer_id"].values
+    nlp_df["all_feedback"] = text_per["all_feedback"].values
+    nlp_df["sentiment_label"] = nlp_df["vader_compound"].apply(
+        lambda s: "positive" if s >= 0.05 else ("negative" if s <= -0.05 else "neutral"))
+    nlp_df["urgency_level"] = nlp_df["urgency_score"].apply(
+        lambda u: "high" if u >= 3 else ("medium" if u >= 1 else "low"))
 
-    # Late fusion: 80% tabular + 20% NLP
-    fused_proba = FUSION_ALPHA * tab_proba + (1 - FUSION_ALPHA) * nlp_proba
-    fused_score = (fused_proba * 100).round(1)
+    X_counts = CV_VEC.transform(nlp_df["all_feedback"].fillna("").tolist())
+    X_topics = LDA.transform(X_counts)
+    nlp_df["dominant_topic"]       = X_topics.argmax(axis=1)
+    nlp_df["dominant_topic_label"] = nlp_df["dominant_topic"].map(TOPIC_NAMES)
+    nlp_df["dominant_topic_score"] = X_topics.max(axis=1)
 
-    # Get segment centroid values for XAI
+    master = master.merge(nlp_df[[
+        "customer_id","sentiment_label","urgency_level","urgency_score",
+        "vader_compound","vader_neg","pct_negative_sent","vader_min_sent",
+        "avg_words_per_sent","dominant_topic_label","dominant_topic_score","all_feedback",
+    ]], on="customer_id", how="left")
+
+    for c in ["urgency_score","vader_compound","vader_neg","pct_negative_sent","vader_min_sent","avg_words_per_sent"]:
+        master[c] = master[c].fillna(0)
+    master["sentiment_label"]      = master["sentiment_label"].fillna("unknown")
+    master["urgency_level"]        = master["urgency_level"].fillna("low")
+    master["dominant_topic_label"] = master["dominant_topic_label"].fillna("No Feedback")
+    master["nlp_red_flag"] = (
+        (master["vader_compound"] < -0.2) & (master["urgency_score"] >= 1)
+    ).astype(int)
+
+    fused_score = (tab_proba * 100).round(1)
+
     centroids_raw = SCALER_SEG.inverse_transform(KMEANS.cluster_centers_)
     centroid_df   = pd.DataFrame(centroids_raw, columns=SEG_FEATURES)
 
-    # Build output
     results = []
     for i in range(len(master)):
-        row       = master.iloc[i]
-        score_val = float(fused_score[i])
-        risk_val  = risk_level(score_val)
-        seg       = row["segment_label"]
-        seg_cl    = int(row["segment_cluster"])
-        seg_prof  = next((p for p in SEG_PROFILES if p["segment_label"] == seg), {})
-        seg_act   = SEG_ACTIONS.get(seg, {})
-        centroid  = centroid_df.iloc[seg_cl].to_dict()
+        row      = master.iloc[i]
+        score_val= float(fused_score[i])
+        risk_val = risk_level(score_val)
+        seg      = row["segment_label"]
+        seg_cl   = int(row["segment_cluster"])
+        seg_prof = next((p for p in SEG_PROFILES if p["segment_label"] == seg), {})
+        centroid = centroid_df.iloc[seg_cl].to_dict()
 
-        # Segment RFM context (actual vs segment average)
         seg_rfm_context = {
-            "days_since_login":      {"customer": round(float(row.get("days_since_login", 0)), 1),
-                                      "segment_avg": round(centroid["days_since_login"], 1)},
-            "payment_count":         {"customer": round(float(row.get("payment_count", 0)), 1),
-                                      "segment_avg": round(centroid["payment_count"], 1)},
-            "total_revenue":         {"customer": round(float(row.get("total_revenue", 0)), 1),
-                                      "segment_avg": round(centroid["total_revenue"], 1)},
-            "monthly_usage_hrs":     {"customer": round(float(row.get("monthly_usage_hrs", 0)), 1),
-                                      "segment_avg": round(centroid["monthly_usage_hrs"], 1)},
-            "feature_adoption_pct":  {"customer": round(float(row.get("feature_adoption_pct", 0)), 1),
-                                      "segment_avg": round(centroid["feature_adoption_pct"], 1)},
-            "avg_nps_score":         {"customer": round(float(row.get("avg_nps_score", 0)), 2),
-                                      "segment_avg": round(centroid["avg_nps_score"], 2)},
+            "days_since_login":     {"customer": round(float(row.get("days_since_login",0)),1),
+                                     "segment_avg": round(centroid["days_since_login"],1)},
+            "payment_count":        {"customer": round(float(row.get("payment_count",0)),1),
+                                     "segment_avg": round(centroid["payment_count"],1)},
+            "total_revenue":        {"customer": round(float(row.get("total_revenue",0)),1),
+                                     "segment_avg": round(centroid["total_revenue"],1)},
+            "monthly_usage_hrs":    {"customer": round(float(row.get("monthly_usage_hrs",0)),1),
+                                     "segment_avg": round(centroid["monthly_usage_hrs"],1)},
+            "feature_adoption_pct": {"customer": round(float(row.get("feature_adoption_pct",0)),1),
+                                     "segment_avg": round(centroid["feature_adoption_pct"],1)},
+            "avg_nps_score":        {"customer": round(float(row.get("avg_nps_score",0)),2),
+                                     "segment_avg": round(centroid["avg_nps_score"],2)},
         }
 
         results.append({
-            # ── Identity ──────────────────────────────────────────────────────
-            "customer_id":           row["customer_id"],
-            "plan_type":             row["plan_type"],
-            "contract_type":         row["contract_type"],
-
-            # ── Churn Score (fused) ───────────────────────────────────────────
-            "churn_score":           score_val,
-            "churn_proba":           round(float(fused_proba[i]), 4),
-            "tabular_proba":         round(float(tab_proba[i]), 4),
-            "nlp_proba":             round(float(nlp_proba[i]), 4),
-            "risk_level":            risk_val,
-
-            # ── SHAP (tabular model) ──────────────────────────────────────────
-            "shap_top5":             get_top_shap(shap_df.iloc[i], top_n=5),
-
-            # ── NLP / Sentiment ───────────────────────────────────────────────
+            "customer_id":          row["customer_id"],
+            "plan_type":            row["plan_type"],
+            "contract_type":        row["contract_type"],
+            "churn_score":          score_val,
+            "churn_proba":          round(float(tab_proba[i]), 4),
+            "tabular_proba":        round(float(tab_proba[i]), 4),
+            "nlp_proba":            None,   # tidak ada late fusion
+            "risk_level":           risk_val,
+            "shap_top5":            get_top_shap(shap_df.iloc[i], top_n=5),
+            "nlp_red_flag":         int(row["nlp_red_flag"]),
             "sentiment": {
-                "label":              nlp_feats["sentiment_label"][i],
-                "vader_compound":     round(float(nlp_feats["vader_compound"][i]), 4),
-                "vader_neg":          round(float(nlp_feats["vader_neg"][i]), 4),
-                "pct_negative_sent":  round(float(nlp_feats["pct_negative_sent"][i]) * 100, 1),
-                "urgency_level":      nlp_feats["urgency_level"][i],
-                "urgency_score":      int(nlp_feats["urgency_score"][i]),
-                "dominant_topic":     nlp_feats["dominant_topic_label"][i],
-                "topic_strength":     round(float(nlp_feats["dominant_topic_score"][i]), 3),
-                "feedback_preview":   str(nlp_input["all_feedback"].iloc[i])[:300],
+                "label":             row["sentiment_label"],
+                "vader_compound":    round(float(row.get("vader_compound",0)), 4),
+                "vader_neg":         round(float(row.get("vader_neg",0)), 4),
+                "pct_negative_sent": round(float(row.get("pct_negative_sent",0)) * 100, 1),
+                "urgency_level":     row["urgency_level"],
+                "urgency_score":     int(row.get("urgency_score",0)),
+                "dominant_topic":    row["dominant_topic_label"],
+                "topic_strength":    round(float(row.get("dominant_topic_score",0)), 3),
+                "feedback_preview":  str(row.get("all_feedback",""))[:300],
             },
-
-            # ── Segmentation ──────────────────────────────────────────────────
-            "segment_label":         seg,
-            "segment_cluster":       seg_cl,
-            "segment_rfm_context":   seg_rfm_context,
-            "segment_profile":       seg_prof,
-            "segment_actions":       seg_act,
+            "segment_label":        seg,
+            "segment_cluster":      seg_cl,
+            "segment_rfm_context":  seg_rfm_context,
+            "segment_profile":      seg_prof,
+            "segment_description":  SEG_DESCS.get(seg, ""),
+            # segment_actions dihapus — Qwen generate per customer
         })
 
     return results
 
 
-# ─── XAI Narrative builders ────────────────────────────────────────────────────
+# ─── XAI Prompt Builders ───────────────────────────────────────────────────────
 def build_churn_xai_prompt(r: dict) -> str:
     """
-    Prompt untuk Churn Prediction XAI.
-    Output: strict JSON dengan 4 field terstruktur.
+    Prompt untuk XAI churn prediction.
+    v2.1: Qwen menentukan sendiri rekomendasi retain & offer per customer —
+    tidak ada opsi hardcoded. AI bebas generate berdasarkan data individu.
     """
     shap_lines = "\n".join([
         f"  {idx+1}. {f['feature_label']} "
@@ -411,53 +311,54 @@ def build_churn_xai_prompt(r: dict) -> str:
         for idx, f in enumerate(r["shap_top5"])
     ])
     sent = r["sentiment"]
-    actions = r["segment_actions"]
-    retain_opts = actions.get("retain", [])
-    offer_opts  = actions.get("offer", [])
+    # nlp_proba adalah None di v2.1 — tampilkan hanya tabular proba
+    ml_prob_str = f"{r['tabular_proba']*100:.1f}%"
+    red_flag_str = " [NLP RED FLAG - feedback sangat negatif]" if r.get("nlp_red_flag") else ""
 
-    return f"""Anda adalah analis customer success senior. Balas HANYA dengan JSON valid, tanpa teks lain, tanpa markdown, tanpa komentar.
+    return f"""Anda adalah analis customer success senior yang berpengalaman. Balas HANYA dengan JSON valid, tanpa teks lain, tanpa markdown, tanpa komentar.
 
 DATA CUSTOMER:
-ID: {r['customer_id']} | Plan: {r['plan_type']} ({r['contract_type']}) | Churn Score: {r['churn_score']}/100 | Risk: {r['risk_level']}
-ML Probability: {r['tabular_proba']*100:.1f}% | NLP Probability: {r['nlp_proba']*100:.1f}%
+ID: {r['customer_id']} | Plan: {r['plan_type']} ({r['contract_type']}) | Churn Score: {r['churn_score']}/100 | Risk: {r['risk_level']}{red_flag_str}
+ML Probability: {ml_prob_str}
 
-FAKTOR SHAP:
+FAKTOR CHURN (SHAP):
 {shap_lines}
 
-SENTIMEN:
-Label: {sent['label'].upper()} | VADER: {sent['vader_compound']:+.3f} | Negatif: {sent['pct_negative_sent']:.1f}%
-Urgency: {sent['urgency_level'].upper()} (score: {sent['urgency_score']}) | Topik: {sent['dominant_topic']}
-Preview: "{sent['feedback_preview'][:150]}"
+SENTIMEN FEEDBACK:
+Label: {sent['label'].upper()} | VADER: {sent['vader_compound']:+.3f} | Kalimat negatif: {sent['pct_negative_sent']:.1f}%
+Urgency: {sent['urgency_level'].upper()} (score: {sent['urgency_score']}) | Topik utama: {sent['dominant_topic']}
+Preview: "{sent['feedback_preview'][:200]}"
 
-OPSI RETENSI: {retain_opts}
-OPSI PENAWARAN: {offer_opts}
+PROFIL SEGMEN: {r.get('segment_description', '')}
 
-Balas dengan JSON persis seperti struktur ini (isi dalam bahasa Indonesia, singkat dan actionable):
+KONTEKS RFM vs RATA-RATA SEGMEN:
+{chr(10).join([f"  {k.replace('_',' ').title()}: customer={v['customer']}, avg={v['segment_avg']}" for k,v in r['segment_rfm_context'].items()])}
+
+Berdasarkan SELURUH data di atas, tentukan tindakan retensi dan penawaran yang PALING TEPAT untuk customer INI secara spesifik.
+Gunakan judgment kamu sebagai analis — tidak ada opsi yang dibatasi.
+
+Balas dengan JSON persis seperti ini (dalam bahasa Indonesia, singkat dan actionable):
 {{
-  "score_reason": "2-3 kalimat menjelaskan mengapa churn score setinggi ini berdasarkan kombinasi ML + NLP + sentimen",
+  "score_reason": "2-3 kalimat mengapa churn score setinggi ini berdasarkan SHAP + sentimen",
   "risk_factors": [
-    "1 kalimat faktor risiko #1 langsung dari SHAP",
-    "1 kalimat faktor risiko #2 langsung dari SHAP",
-    "1 kalimat faktor risiko #3 langsung dari SHAP"
+    "1 kalimat faktor risiko terbesar dari SHAP",
+    "1 kalimat faktor risiko kedua",
+    "1 kalimat insight dari sentimen/feedback"
   ],
-  "feedback_signal": "1-2 kalimat tentang apa yang tersirat dari feedback dan sentimen pelanggan",
+  "feedback_signal": "1-2 kalimat apa yang tersirat dari feedback dan perilaku customer ini",
   "action": {{
-    "retain": "nama aksi retensi yang dipilih dari opsi",
-    "offer": "nama penawaran yang dipilih dari opsi",
-    "reason": "1 kalimat alasan mengapa kombinasi ini paling tepat untuk pelanggan ini"
+    "retain": "tindakan retensi terbaik untuk customer INI (contoh: jadwalkan video call dengan CS lead, kirim email personal dari CEO, tawarkan dedicated account manager, dll)",
+    "offer": "penawaran terbaik untuk customer INI (contoh: diskon 30% 6 bulan, upgrade gratis 3 bulan, onboarding ulang gratis, perpanjang kontrak dengan harga dikunci, dll)",
+    "reason": "1 kalimat mengapa kombinasi ini paling tepat untuk profil customer ini secara spesifik"
   }}
 }}"""
 
 
 def build_segment_xai_prompt(r: dict) -> str:
-    """
-    Prompt untuk Customer Segmentation XAI.
-    Output: strict JSON dengan 4 field terstruktur.
-    """
+    """Prompt untuk XAI segmentasi customer."""
     rfm = r["segment_rfm_context"]
     sent = r["sentiment"]
     seg_prof = r["segment_profile"]
-    seg_act  = r["segment_actions"]
 
     rfm_lines = "\n".join([
         f"  {k.replace('_',' ').title()}: customer={v['customer']:.1f}, segment_avg={v['segment_avg']:.1f}"
@@ -469,17 +370,18 @@ def build_segment_xai_prompt(r: dict) -> str:
 PROFIL CUSTOMER:
 ID: {r['customer_id']} | Plan: {r['plan_type']} ({r['contract_type']})
 Segment: {r['segment_label']} | Churn Score: {r['churn_score']}/100
+Deskripsi segment: {r.get('segment_description', '')}
 
 NILAI RFM vs RATA-RATA SEGMENT:
 {rfm_lines}
 
 PROFIL SEGMENT:
-Jumlah customer: {seg_prof.get('count','N/A')} | Avg churn score: {seg_prof.get('avg_churn_score','N/A')}/100
-% High risk: {seg_prof.get('pct_high_risk','N/A')}% | Deskripsi: {seg_act.get('description','')}
+Jumlah customer: {seg_prof.get('count','N/A')} | Avg churn: {seg_prof.get('avg_churn_score','N/A')}/100
+% High risk: {seg_prof.get('pct_high_risk','N/A')}%
 
 SENTIMEN: {sent['label']} (VADER: {sent['vader_compound']:+.3f}) | Topik: {sent['dominant_topic']} | Urgency: {sent['urgency_level']}
 
-Balas dengan JSON persis seperti struktur ini (isi dalam bahasa Indonesia):
+Balas dengan JSON persis seperti ini (bahasa Indonesia):
 {{
   "segment_reason": "2-3 kalimat mengapa customer masuk segment ini berdasarkan nilai RFM",
   "characteristics": [
@@ -487,24 +389,20 @@ Balas dengan JSON persis seperti struktur ini (isi dalam bahasa Indonesia):
     "1 kalimat perbedaan customer vs rata-rata segment #2",
     "1 kalimat perbedaan customer vs rata-rata segment #3"
   ],
-  "watch_out": "1-2 kalimat insight khusus dari kombinasi segment + sentimen + topik",
+  "watch_out": "1-2 kalimat insight dari kombinasi segment + sentimen + topik",
   "strategy": "1-2 kalimat pendekatan terbaik untuk customer di segment ini"
 }}"""
 
 
 async def call_qwen(prompt: str) -> str:
-    """
-    Call OpenAI-compatible chat API. Returns raw string (JSON or error message).
-    Supports both native Ollama (/api/chat) and OpenAI-compatible (/chat/completions).
-    """
+    """Call OpenAI-compatible chat API."""
     _raw_url = os.getenv("OLLAMA_URL", "https://api.openai.com/v1")
     if not _raw_url.startswith("http"):
         _raw_url = f"https://{_raw_url}"
     base_url = _raw_url.rstrip("/")
 
     is_native_ollama = (
-        "localhost" in base_url
-        or "127.0.0.1" in base_url
+        "localhost" in base_url or "127.0.0.1" in base_url
         or base_url.rstrip("/").endswith("/api")
     )
 
@@ -514,42 +412,36 @@ async def call_qwen(prompt: str) -> str:
 
     if is_native_ollama:
         endpoint = base_url.replace("/v1", "").rstrip("/") + "/api/chat"
-        payload = {
-            "model":    OLLAMA_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream":   False,
-            "format":   "json",
-            "options":  {"temperature": 0.2, "num_predict": 500},
+        payload  = {
+            "model":   OLLAMA_MODEL,
+            "messages":[{"role":"user","content":prompt}],
+            "stream":  False, "format": "json",
+            "options": {"temperature":0.2, "num_predict":600},
         }
     else:
         endpoint = f"{base_url}/chat/completions"
-        payload = {
-            "model":       OLLAMA_MODEL,
-            "messages":    [{"role": "user", "content": prompt}],
-            "max_tokens":  600,
+        payload  = {
+            "model":    OLLAMA_MODEL,
+            "messages": [{"role":"user","content":prompt}],
+            "max_tokens": 700,
             "temperature": 0.2,
-            "response_format": {"type": "json_object"},
+            "response_format": {"type":"json_object"},
         }
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=90.0) as client:
             resp = await client.post(endpoint, headers=headers, json=payload)
             resp.raise_for_status()
             data = resp.json()
-
         if "choices" in data:
             content = data["choices"][0]["message"]["content"]
         elif "message" in data:
             content = data["message"]["content"]
         else:
-            return json.dumps({"error": f"unexpected response shape: {list(data.keys())}"})
-
-        # Strip <think>...</think> blocks emitted by some Qwen models
+            return json.dumps({"error": f"unexpected shape: {list(data.keys())}"})
         content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-        # Strip markdown code fences if model wraps JSON in ```
         content = re.sub(r"^```(?:json)?\s*", "", content).rstrip("```").strip()
         return content
-
     except httpx.ConnectError as e:
         return json.dumps({"error": f"cannot connect to {endpoint}: {str(e)[:100]}"})
     except httpx.HTTPStatusError as e:
@@ -561,22 +453,23 @@ async def call_qwen(prompt: str) -> str:
 # ─── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
+    # FIX v2.1: tidak ada lagi reference ke N (nlp_artifacts)
     return {
         "status":        "ok",
-        "model_version": A.get("model_version", "v1.0"),
-        "fusion_alpha":  FUSION_ALPHA,
-        "nlp_auc":       N.get("nlp_auc_cv"),
+        "model_version": A.get("model_version", "v2.1"),
+        "nlp_role":      A.get("nlp_role", "xai_context_and_flag"),
+        "risk_thresholds": {"low": RISK_LOW, "high": RISK_HIGH},
     }
 
 
 @app.post("/predict")
 async def predict(
-    customer_accounts:          UploadFile = File(...),
-    monthly_usage_metrics:      UploadFile = File(...),
-    billing_data:               UploadFile = File(...),
-    support_tickets:            UploadFile = File(...),
-    nps_surveys_with_feedback:  UploadFile = File(...),
-    generate_xai:               bool = True,
+    customer_accounts:         UploadFile = File(...),
+    monthly_usage_metrics:     UploadFile = File(...),
+    billing_data:              UploadFile = File(...),
+    support_tickets:           UploadFile = File(...),
+    nps_surveys_with_feedback: UploadFile = File(...),
+    generate_xai:              bool = True,
 ):
     """Predict all customers. Returns list with churn + segment XAI per customer."""
     try:
@@ -595,7 +488,6 @@ async def predict(
 
     if generate_xai:
         for r in results:
-            # Two separate XAI narratives
             churn_prompt   = build_churn_xai_prompt(r)
             segment_prompt = build_segment_xai_prompt(r)
             r["xai_churn_explanation"]   = await call_qwen(churn_prompt)
@@ -610,14 +502,14 @@ async def predict(
 
 @app.post("/predict/single")
 async def predict_single(
-    customer_id:                str,
-    customer_accounts:          UploadFile = File(...),
-    monthly_usage_metrics:      UploadFile = File(...),
-    billing_data:               UploadFile = File(...),
-    support_tickets:            UploadFile = File(...),
-    nps_surveys_with_feedback:  UploadFile = File(...),
+    customer_id:               str,
+    customer_accounts:         UploadFile = File(...),
+    monthly_usage_metrics:     UploadFile = File(...),
+    billing_data:              UploadFile = File(...),
+    support_tickets:           UploadFile = File(...),
+    nps_surveys_with_feedback: UploadFile = File(...),
 ):
-    """Single customer — full XAI for both churn prediction and segmentation."""
+    """Single customer — full XAI untuk churn prediction dan segmentasi."""
     try:
         ca_df  = pd.read_csv(io.BytesIO(await customer_accounts.read()))
         um_df  = pd.read_csv(io.BytesIO(await monthly_usage_metrics.read()))
@@ -630,7 +522,6 @@ async def predict_single(
     if customer_id not in ca_df["customer_id"].values:
         raise HTTPException(status_code=404, detail=f"{customer_id} not found")
 
-    # Filter to single customer across all datasets
     for df in [ca_df, um_df, bd_df, st_df, nps_df]:
         mask = df["customer_id"] == customer_id
         df.drop(df[~mask].index, inplace=True)
