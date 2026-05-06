@@ -235,7 +235,9 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     master["sentiment_label"]      = master["sentiment_label"].fillna("unknown")
     master["urgency_level"]        = master["urgency_level"].fillna("low")
     master["dominant_topic_label"] = master["dominant_topic_label"].fillna("No Feedback")
+    # nlp_red_flag only if model is "safe" (<= RISK_HIGH) but NLP is negative
     master["nlp_red_flag"] = (
+        (fused_score <= RISK_HIGH) &
         (master["vader_compound"] < -0.2) & (master["urgency_score"] >= 1)
     ).astype(int)
 
