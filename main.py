@@ -376,7 +376,7 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
                 "urgency_score":     int(row.get("urgency_score",0)),
                 "dominant_topic":    row["dominant_topic_label"],
                 "topic_strength":    round(float(row.get("dominant_topic_score",0)), 3),
-                "feedback_preview":  str(row.get("all_feedback",""))[:300],
+                "feedback_preview":  str(row.get("all_feedback","")),
             },
             "segment_label":        seg,
             "segment_cluster":      seg_cl,
@@ -428,7 +428,7 @@ FAKTOR CHURN (SHAP):
 SENTIMEN FEEDBACK:
 Label: {sent['label'].upper()} | VADER: {sent['vader_compound']:+.3f} | Kalimat negatif: {sent['pct_negative_sent']:.1f}%
 Urgency: {sent['urgency_level'].upper()} (score: {sent['urgency_score']}) | Topik utama: {sent['dominant_topic']}
-Preview: "{sent['feedback_preview'][:200]}"
+Preview: "{sent['feedback_preview'][:1000]}"
 
 PROFIL SEGMEN: {r.get('segment_description', '')}
 
