@@ -218,7 +218,15 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     # ── Segmentation (sebelum imputation) ─────────────────────────────────────
     seg_raw = master[SEG_FEATURES].copy()
     for c in SEG_FEATURES:
-        seg_raw[c] = seg_raw[c].fillna(seg_raw[c].median())
+        # FIX KMEANS NaN: fillna(median) lalu fillna(0) sebagai safety net.
+        # Ketika predict/single dipanggil untuk customer tanpa NPS, nps_df kosong
+        # sehingga avg_nps_score = NaN. median() dari series yang ALL NaN = NaN juga,
+        # sehingga fillna(median) tidak membantu. fillna(0) sebagai fallback akhir
+        # memastikan tidak ada NaN yang masuk ke KMEANS.predict().
+        col_median = seg_raw[c].median()
+        seg_raw[c] = seg_raw[c].fillna(col_median if pd.notna(col_median) else 0.0)
+    # Pastikan tidak ada NaN tersisa sebelum transform (defence-in-depth)
+    seg_raw = seg_raw.fillna(0.0)
     X_seg = SCALER_SEG.transform(seg_raw.values)
     master["segment_cluster"] = KMEANS.predict(X_seg)
     master["segment_label"]   = master["segment_cluster"].map(LABEL_MAP)
@@ -393,8 +401,9 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
             "risk_level":           risk_val,
             "shap_top5":            get_top_shap(shap_df.iloc[i], top_n=5),
             "nlp_red_flag":         int(row["nlp_red_flag"]),
-            "loyalty_risk_flag":    int(row["loyalty_risk_flag"]),   # NEW v2.3
-            "has_nps_data":         int(row["has_nps_data"]),        # NEW v2.3 — explicit flag
+            "loyalty_risk_flag":    int(row["loyalty_risk_flag"]),
+            "has_nps_data":         int(row["has_nps_data"]),
+            "tenure_days":          int(row.get("tenure_days", 0)),
             "sentiment": {
                 "label":             row["sentiment_label"],
                 "vader_compound":    round(float(row.get("vader_compound", 0)), 4),
