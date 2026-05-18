@@ -528,15 +528,15 @@ async def call_qwen(prompt: str) -> str:
             "model":   OLLAMA_MODEL,
             "messages":[{"role":"user","content":prompt}],
             "stream":  False, "format": "json",
-            "options": {"temperature":0.2, "num_predict":600},
+            "options": {"temperature":0.1, "num_predict": 1500},
         }
     else:
         endpoint = f"{base_url}/chat/completions"
         payload  = {
             "model":    OLLAMA_MODEL,
             "messages": [{"role":"user","content":prompt}],
-            "max_tokens": 700,
-            "temperature": 0.2,
+            "max_tokens": 2000,
+            "temperature": 0.1,
             "response_format": {"type":"json_object"},
         }
 
@@ -601,9 +601,16 @@ async def predict(
         raise HTTPException(status_code=500, detail=f"Pipeline error: {e}")
 
     if generate_xai:
-        for r in results:
-            r["xai_churn_explanation"]   = await call_qwen(build_churn_xai_prompt(r))
-            r["xai_segment_explanation"] = await call_qwen(build_segment_xai_prompt(r))
+        import asyncio
+        async def generate_all_xai(r):
+            res = await asyncio.gather(
+                call_qwen(build_churn_xai_prompt(r)),
+                call_qwen(build_segment_xai_prompt(r))
+            )
+            r["xai_churn_explanation"] = res[0]
+            r["xai_segment_explanation"] = res[1]
+
+        await asyncio.gather(*[generate_all_xai(r) for r in results])
     else:
         for r in results:
             r["xai_churn_explanation"]   = None
@@ -643,6 +650,11 @@ async def predict_single(
 
     results = run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df)
     r = results[0]
-    r["xai_churn_explanation"]   = await call_qwen(build_churn_xai_prompt(r))
-    r["xai_segment_explanation"] = await call_qwen(build_segment_xai_prompt(r))
+    import asyncio
+    xai_churn, xai_seg = await asyncio.gather(
+        call_qwen(build_churn_xai_prompt(r)),
+        call_qwen(build_segment_xai_prompt(r))
+    )
+    r["xai_churn_explanation"]   = xai_churn
+    r["xai_segment_explanation"] = xai_seg
     return r
