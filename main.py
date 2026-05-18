@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # ─── App ──────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Churn Prediction API", version="2.3.0")
+app = FastAPI(title="Churn Prediction API", version="2.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,7 +22,7 @@ app.add_middleware(
 
 # ─── Load artifacts ───────────────────────────────────────────────────────────
 print("Loading artifacts...")
-A = joblib.load(os.getenv("ARTIFACTS_PATH", "churn_artifacts_v2.pkl"))
+A = joblib.load(os.getenv("ARTIFACTS_PATH", "model/churn_artifacts_v61.pkl"))
 
 MODEL        = A["model"]
 FEATURES     = A["production_features"]
@@ -51,53 +51,12 @@ OLLAMA_KEY   = os.getenv("OLLAMA_API_KEY", "")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-4o-mini")
 
 # Plan-aware action options untuk Qwen (v2.2+)
-PLAN_ACTIONS = {
-    "Enterprise": {
-        "retain": [
-            "Jadwalkan Executive Business Review dengan C-level",
-            "Assign dedicated Customer Success Manager",
-            "Sesi strategy call dengan tim product",
-            "Audit menyeluruh penggunaan platform oleh tim teknis",
-        ],
-        "offer": [
-            "Perpanjang kontrak dengan harga terkunci (price lock 2 tahun)",
-            "Upgrade gratis ke tier tertinggi selama 1 kuartal",
-            "Diskon 25-30% untuk renewal tahunan",
-            "SLA premium + prioritas dukungan 24/7",
-        ],
-    },
-    "Professional": {
-        "retain": [
-            "Jadwalkan video call dengan Customer Success specialist",
-            "Sesi onboarding lanjutan + feature training",
-            "Kirim email personal dari Account Manager",
-            "Undangan ke webinar eksklusif + komunitas pengguna",
-        ],
-        "offer": [
-            "Diskon 20% untuk 3 bulan ke depan",
-            "Upgrade gratis ke Enterprise selama 2 bulan",
-            "Tambahan kursi pengguna gratis selama 3 bulan",
-            "Free month dengan komitmen renewal tahunan",
-        ],
-    },
-    "Starter": {
-        "retain": [
-            "Kirim onboarding email series yang dipersonalisasi",
-            "Undangan ke sesi live demo & Q&A",
-            "Hubungi via chat — tawarkan panduan setup 1-on-1",
-            "Kirim success story dari customer dengan profil serupa",
-        ],
-        "offer": [
-            "1 bulan gratis tanpa syarat",
-            "Upgrade ke Professional dengan harga Starter selama 3 bulan",
-            "Diskon 30% untuk 2 bulan + akses fitur premium",
-            "Perpanjang trial fitur advanced gratis 30 hari",
-        ],
-    },
-}
+# PLAN_ACTIONS & RISK_HIGH_BIZ dimuat dari artifact (source of truth = notebook v6.1)
+PLAN_ACTIONS  = A.get("plan_actions", {})
+RISK_HIGH_BIZ = A["risk_thresholds"].get("high_biz", RISK_HIGH)
 
 print(f"Artifacts loaded | model v{A.get('model_version','?')} | "
-      f"k={KMEANS.n_clusters} clusters | RISK_LOW={RISK_LOW} | RISK_HIGH={RISK_HIGH}")
+      f"k={KMEANS.n_clusters} clusters | RISK_LOW={RISK_LOW} | RISK_HIGH={RISK_HIGH} | RISK_HIGH_BIZ={RISK_HIGH_BIZ}")
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 def risk_level(score: float) -> str:
@@ -167,9 +126,10 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
             if c in df.columns:
                 df[c] = pd.to_datetime(df[c], errors="coerce")
 
-    ca_df["tenure_days"] = (
+    ca_df["tenure_days"]  = (
         ca_df["unsubscribed_date"].fillna(REF) - ca_df["subscription_date"]
     ).dt.days.clip(lower=1)
+    ca_df["tenure_capped"] = ca_df["tenure_days"].clip(upper=365)
 
     # ── Feature engineering ────────────────────────────────────────────────
     payments = bd_df[bd_df["record_type"] == "payment"].copy()
@@ -203,7 +163,7 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
         pct_detractor=("segment",lambda x:(x=="detractor").mean()),
     ).reset_index(); nf["has_nps_data"] = 1
 
-    master = ca_df[["customer_id","plan_type","contract_type","total_users","tenure_days"]].copy()
+    master = ca_df[["customer_id","plan_type","contract_type","total_users","tenure_days","tenure_capped"]].copy()
     master = (master
         .merge(uf, on="customer_id", how="left")
         .merge(bf, on="customer_id", how="left")
@@ -252,7 +212,7 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     master["contract_enc"] = LE_CONTRACT.transform(master["contract_type"])
     for col in ["total_users","monthly_usage_hrs","total_revenue","total_tickets"]:
         master[f"log_{col}"] = np.log1p(master[col])
-    master["dunning_per_tenure"]  = master["dunning_count"]      / (master["tenure_days"] / 30).replace(0,1)
+    master["dunning_per_tenure"]  = master["dunning_count"]      / (master["tenure_capped"] / 30).replace(0,1)
     master["usage_per_user"]      = master["monthly_usage_hrs"]   / master["total_users"].replace(0,1)
     master["ticket_per_revenue"]  = master["total_tickets"]       / (master["total_revenue"].replace(0,1)/1000)
     master["adoption_x_usage"]    = master["feature_adoption_pct"] * master["log_monthly_usage_hrs"]
@@ -332,11 +292,11 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
         (master["urgency_score"] >= 1)
     ).astype(int)
 
-    # LOYALTY RISK FLAG: Low churn score TAPI Unhappy Users + tenure panjang
+    # LOYALTY RISK FLAG: Low churn score TAPI Critical segment + tenure panjang
     # Menangkap "silent at-risk" — customer loyal yang sudah tidak puas
     master["loyalty_risk_flag"] = (
         (fused_score <= RISK_LOW) &
-        (master["segment_label"] == "Unhappy Users") &
+        (master["segment_label"] == "Critical") &
         (master["tenure_days"] > 365)
     ).astype(int)
 
@@ -440,7 +400,7 @@ def build_churn_xai_prompt(r: dict) -> str:
     sent = r["sentiment"]
     ml_prob_str  = f"{r['tabular_proba']*100:.1f}%"
     red_flag_str = " [NLP RED FLAG - feedback sangat negatif]" if r.get("nlp_red_flag") else ""
-    loyalty_str  = " [LOYALTY RISK - Low churn score tapi Unhappy segment + loyal lama]" if r.get("loyalty_risk_flag") else ""
+    loyalty_str  = " [LOYALTY RISK - Low churn score tapi Critical segment + loyal lama]" if r.get("loyalty_risk_flag") else ""
 
     plan_key    = r["plan_type"] if r["plan_type"] in PLAN_ACTIONS else "Professional"
     plan_opts   = PLAN_ACTIONS[plan_key]
@@ -510,7 +470,7 @@ def build_segment_xai_prompt(r: dict) -> str:
     rfm = r["segment_rfm_context"]
     sent = r["sentiment"]
     seg_prof = r["segment_profile"]
-    loyalty_note = "\nCATATAN: Customer ini memiliki Loyalty Risk Flag — Low churn tapi masuk Unhappy segment dengan tenure panjang. Sertakan insight ini dalam strategi." if r.get("loyalty_risk_flag") else ""
+    loyalty_note = "\nCATATAN: Customer ini memiliki Loyalty Risk Flag — Low churn tapi masuk Critical segment dengan tenure panjang. Sertakan insight ini dalam strategi." if r.get("loyalty_risk_flag") else ""
 
     rfm_lines = "\n".join([
         f"  {k.replace('_',' ').title()}: customer={v['customer']:.1f}, segment_avg={v['segment_avg']:.1f}"
@@ -608,7 +568,7 @@ def health():
     return {
         "status":           "ok",
         "model_version":    A.get("model_version", "v2.1"),
-        "pipeline_version": "v2.3",
+        "pipeline_version": "v2.4",
         "nlp_role":         A.get("nlp_role", "xai_context_and_flag"),
         "seg_features":     SEG_FEATURES,
         "n_clusters":       int(KMEANS.n_clusters),
