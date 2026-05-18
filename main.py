@@ -21,7 +21,7 @@ app.add_middleware(
 )
 
 # ─── Load artifacts ───────────────────────────────────────────────────────────
-print("Loading artifacts...")
+print("Loading artifacts")
 A = joblib.load(os.getenv("ARTIFACTS_PATH", "model/churn_artifacts_v61.pkl"))
 
 MODEL        = A["model"]
