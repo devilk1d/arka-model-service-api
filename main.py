@@ -25,7 +25,7 @@ app.add_middleware(
 # ─── Load artifacts ───────────────────────────────────────────────────────────
 print("Loading artifacts...")
 
-A = joblib.load(os.getenv("ARTIFACTS_PATH", "arka_model_final.pkl"))
+A = joblib.load(os.getenv("ARTIFACTS_PATH", "churn_artifacts_v100.pkl"))
 
 # v10 saves both best model and calibrated model — prefer calibrated
 # The calibrated model gives better probability estimates (lower Brier score)
