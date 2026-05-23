@@ -439,52 +439,39 @@ def build_churn_xai_prompt(r: dict) -> str:
         for idx, f in enumerate(r["shap_top5"])
     ])
     sent    = r["sentiment"]
-    seg_act = r["segment_actions"]
-    retain_opts = seg_act.get("retain", [])
-    offer_opts  = seg_act.get("offer",  [])
+    rfm     = r["segment_rfm_context"]
 
     flags = []
     if r.get("nlp_red_flag"):
-        flags.append("⚠️ NLP Red Flag: sentimen sangat negatif + urgency tinggi")
+        flags.append("NLP Red Flag: sentimen sangat negatif + urgency tinggi")
     if r.get("loyalty_risk_flag"):
-        flags.append("🔒 Loyalty Risk Flag: score rendah tapi segment Critical + tenure >1 tahun")
-    flag_section = "\n".join(flags) if flags else "Tidak ada flag khusus"
+        flags.append("Loyalty Risk Flag: score rendah tapi segment Critical + tenure >1 tahun")
+    flag_section = ", ".join(flags) if flags else "Tidak ada"
 
-    return f"""Anda adalah analis customer success senior. Balas HANYA dengan JSON valid, tanpa teks lain, tanpa markdown, tanpa komentar.
+    # Customer context for personalized action recommendation
+    tenure    = rfm.get("days_since_login", {}).get("customer", 0)
+    revenue   = rfm.get("total_revenue", {}).get("customer", 0)
+    usage     = rfm.get("monthly_usage_hrs", {}).get("customer", 0)
+    adoption  = rfm.get("feature_adoption_pct", {}).get("customer", 0)
+    nps       = rfm.get("avg_nps_score", {}).get("customer", 0)
 
-DATA CUSTOMER:
-ID: {r['customer_id']} | Plan: {r['plan_type']} ({r['contract_type']}) | Churn Score: {r['churn_score']}/100 | Risk: {r['risk_level']}
-ML Probability (calibrated): {r['churn_proba']*100:.1f}%
+    return f"""Anda adalah analis customer success senior. Balas HANYA dengan JSON valid, tanpa teks lain, tanpa markdown.
+
+CUSTOMER: {r['customer_id']} | Plan: {r['plan_type']} ({r['contract_type']}) | Segment: {r['segment_label']}
+Churn Score: {r['churn_score']}/100 | Risk: {r['risk_level']} | Probability: {r['churn_proba']*100:.1f}%
+Revenue: ${revenue:,.0f}/mo | Usage: {usage:.0f}h/mo | Adoption: {adoption:.0f}% | NPS: {nps:.1f}/10
+Days since login: {tenure:.0f} | Flags: {flag_section}
 
 FAKTOR SHAP:
 {shap_lines}
 
-SENTIMEN:
-Label: {sent['label'].upper()} | VADER: {sent['vader_compound']:+.3f} | Negatif: {sent['pct_negative_sent']:.1f}%
-Urgency: {sent['urgency_level'].upper()} (score: {sent['urgency_score']}) | Topik: {sent['dominant_topic']}
-Preview: "{sent['feedback_preview'][:150]}"
+SENTIMEN: {sent['label'].upper()} | VADER: {sent['vader_compound']:+.3f} | Urgency: {sent['urgency_level']} ({sent['urgency_score']}) | Topik: {sent['dominant_topic']}
+Feedback: "{sent['feedback_preview'][:200]}"
 
-FLAGS (v10):
-{flag_section}
+Berikan rekomendasi retain dan offer yang SPESIFIK untuk customer ini berdasarkan plan, revenue, usage, dan sentiment-nya. Jangan gunakan opsi generik. Sesuaikan dengan kondisi aktual customer.
 
-OPSI RETENSI: {retain_opts}
-OPSI PENAWARAN: {offer_opts}
-
-Balas dengan JSON persis seperti struktur ini (isi dalam bahasa Indonesia, singkat dan actionable):
-{{
-  "score_reason": "2-3 kalimat menjelaskan mengapa churn score setinggi ini berdasarkan SHAP + sentimen",
-  "risk_factors": [
-    "1 kalimat faktor risiko #1 langsung dari SHAP",
-    "1 kalimat faktor risiko #2 langsung dari SHAP",
-    "1 kalimat faktor risiko #3 langsung dari SHAP"
-  ],
-  "feedback_signal": "1-2 kalimat tentang apa yang tersirat dari feedback dan sentimen pelanggan",
-  "action": {{
-    "retain": "nama aksi retensi yang dipilih dari opsi",
-    "offer": "nama penawaran yang dipilih dari opsi",
-    "reason": "1 kalimat alasan mengapa kombinasi ini paling tepat untuk pelanggan ini"
-  }}
-}}"""
+Balas JSON (bahasa Indonesia, singkat dan actionable):
+{{"score_reason":"...","risk_factors":["...","...","..."],"feedback_signal":"...","action":{{"retain":"aksi retensi spesifik untuk customer ini","offer":"penawaran spesifik untuk customer ini","reason":"..."}}}}"""
 
 
 def build_segment_xai_prompt(r: dict) -> str:
@@ -531,18 +518,8 @@ RECOMMENDED ACTIONS (plan-based):
 Retain: {seg_act.get('retain', [])}
 Offer: {seg_act.get('offer', [])}
 
-Balas dengan JSON persis seperti struktur ini (isi dalam bahasa Indonesia, data harus akurat dan spesifik):
-{{
-  "segment_reason": "2-3 kalimat mengapa customer masuk segment ini berdasarkan nilai RFM aktual",
-  "characteristics": [
-    "1 kalimat perbedaan signifikan customer vs rata-rata segment (dari RFM)",
-    "1 kalimat tentang pola sentimen / topik feedback yang mencerminkan perilaku customer",
-    "1 kalimat tentang implikasi risiko churn untuk customer ini di segmen ini"
-  ],
-  "watch_out": "1-2 kalimat insight khusus dari kombinasi segment + sentimen + flags + topik",
-  "strategy": "1-2 kalimat pendekatan retention terbaik untuk customer ini berdasarkan plan dan segment",
-  "segment_narrative": "3-4 kalimat deskripsi kohort segment ini secara keseluruhan (untuk ditampilkan di panel segmentasi, bukan per-customer)"
-}}"""
+Balas JSON (bahasa Indonesia, singkat):
+{{"segment_reason":"...","characteristics":["...","...","..."],"watch_out":"...","strategy":"..."}}"""
 
 
 def build_segment_cohort_prompt(seg_label: str, seg_prof: dict, seg_desc: str,
@@ -606,15 +583,15 @@ async def call_llm(prompt: str) -> str:
             "messages": [{"role": "user", "content": prompt}],
             "stream":   False,
             "format":   "json",
-            "options":  {"temperature": 0.2, "num_predict": 600},
+            "options":  {"temperature": 0.2, "num_predict": 1200},
         }
     else:
         endpoint = f"{base_url}/chat/completions"
         payload  = {
             "model":       LLM_MODEL,
             "messages":    [{"role": "user", "content": prompt}],
-            "max_tokens":  2000,
-            "temperature": 0.1,
+            "max_tokens":  1200,
+            "temperature": 0.2,
             "response_format": {"type": "json_object"},
         }
 
