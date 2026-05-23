@@ -25,7 +25,7 @@ app.add_middleware(
 # ─── Load artifacts ───────────────────────────────────────────────────────────
 print("Loading artifacts...")
 
-A = joblib.load(os.getenv("ARTIFACTS_PATH", "churn_artifacts_v100.pkl"))
+A = joblib.load(os.getenv("ARTIFACTS_PATH", "churn_artifacts_v1.pkl"))
 
 # v10 saves both best model and calibrated model — prefer calibrated
 # The calibrated model gives better probability estimates (lower Brier score)
@@ -65,6 +65,13 @@ LLM_MODEL = os.getenv("OLLAMA_MODEL",    "qwen3.5:397b-cloud")
 FUSION_ALPHA = float(os.getenv("FUSION_ALPHA", "1.0"))  # v10: single calibrated model, no NLP fusion
 
 print("✅ Artifacts loaded (v10 — calibrated model active)")
+print(f"   model_version : {A.get('model_version', 'unknown')}")
+print(f"   model_name    : {A.get('model_name', 'unknown')}")
+print(f"   has_calibrated: {'calibrated_model' in A}")
+print(f"   SEG_FEATURES  : {SEG_FEATURES}")
+print(f"   FEATURES count: {len(FEATURES)}")
+print(f"   RISK_LOW/HIGH : {RISK_LOW} / {RISK_HIGH}")
+print(f"   N_TOPICS      : {N_TOPICS}")
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 def risk_level(score: float) -> str:
