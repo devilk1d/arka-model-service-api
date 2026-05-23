@@ -9,6 +9,7 @@ import httpx
 from scipy.sparse import hstack, csr_matrix
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from sklearn.preprocessing import StandardScaler
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
@@ -622,6 +623,53 @@ async def call_llm(prompt: str) -> str:
 
 
 # ─── Endpoints ─────────────────────────────────────────────────────────────────
+class SegmentCohortRequest(BaseModel):
+    segment_label: str
+    total_customers: int
+    avg_churn_score: float
+    pct_high_risk: float
+    avg_revenue: float
+    avg_usage_hrs: float
+    avg_nps: float
+    avg_tenure_days: float = 0.0
+    churn_rate: float = 0.0
+    segment_description: str = ""
+    retain_actions: list = []
+    offer_actions: list = []
+    total_all_customers: int = 0
+
+
+@app.post("/generate-cohort-xai")
+async def generate_cohort_xai(segments: list[SegmentCohortRequest]):
+    """
+    Generate LLM cohort narratives from pre-aggregated segment stats.
+    Does NOT re-run the ML pipeline — only calls the LLM per segment.
+    Used by the regenerate button on the Segmentation page.
+    """
+    results: dict[str, str] = {}
+    total = sum(s.total_customers for s in segments) or 1
+    for seg in segments:
+        prompt = build_segment_cohort_prompt(
+            seg_label       = seg.segment_label,
+            seg_prof        = {
+                "count":            seg.total_customers,
+                "avg_churn_score":  seg.avg_churn_score,
+                "pct_high_risk":    seg.pct_high_risk,
+                "avg_revenue":      seg.avg_revenue,
+                "avg_usage_hrs":    seg.avg_usage_hrs,
+                "avg_nps":          seg.avg_nps,
+                "avg_tenure_days":  seg.avg_tenure_days,
+                "churn_rate":       seg.churn_rate,
+            },
+            seg_desc        = seg.segment_description,
+            retain_actions  = seg.retain_actions,
+            offer_actions   = seg.offer_actions,
+            total_customers = seg.total_all_customers or total,
+        )
+        results[seg.segment_label] = await call_llm(prompt)
+    return {"status": "success", "cohort_xai": results}
+
+
 @app.get("/health")
 def health():
     model_type = type(MODEL).__name__
