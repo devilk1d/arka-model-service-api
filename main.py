@@ -238,6 +238,13 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
               .merge(tf, on="customer_id", how="left")
               .merge(nf, on="customer_id", how="left"))
 
+    # ── Fillna(0) semua kolom numerik sebelum pipeline lanjut ───────────────────
+    # Ini mencegah KeyError/NaN error jika sub-table (billing/usage/ticket) kosong
+    # setelah left-merge — kolom tetap ada tapi NaN, bukan missing sama sekali.
+    # Khusus kolom string/text tidak tersentuh karena select_dtypes(include=number).
+    _numeric_cols = master.select_dtypes(include=[np.number]).columns
+    master[_numeric_cols] = master[_numeric_cols].fillna(0)
+
     # ── Segmentation (before imputation, using log_revenue/log_usage) ──────────
     master["log_revenue"] = np.log1p(master["total_revenue"].fillna(0))
     master["log_usage"]   = np.log1p(master["monthly_usage_hrs"].fillna(0))
