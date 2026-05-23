@@ -613,8 +613,8 @@ async def call_llm(prompt: str) -> str:
         payload  = {
             "model":       LLM_MODEL,
             "messages":    [{"role": "user", "content": prompt}],
-            "max_tokens":  700,
-            "temperature": 0.2,
+            "max_tokens":  2000,
+            "temperature": 0.1,
             "response_format": {"type": "json_object"},
         }
 
