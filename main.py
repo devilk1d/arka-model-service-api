@@ -319,10 +319,10 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     shap_df = pd.DataFrame(shap_vals, columns=FEATURES)
 
     # ── Score & risk ──────────────────────────────────────────────────────────
-    churn_score = (tab_proba * 100).round(1)
+    churn_score = (tab_proba * 100).round(1)          # numpy ndarray
     master["churn_proba"] = tab_proba.round(4)
     master["churn_score"] = churn_score
-    master["risk_level"]  = churn_score.apply(risk_level)   # type: ignore[arg-type]
+    master["risk_level"]  = [risk_level(s) for s in churn_score]  # list comprehension, not .apply()
 
     # ── NLP flags (v10: Cell 91) ───────────────────────────────────────────────
     master = compute_nlp_flags(master)
