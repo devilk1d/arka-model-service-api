@@ -265,25 +265,29 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     master["plan_enc"]     = LE_PLAN.transform(master["plan_type"])
     master["contract_enc"] = LE_CONTRACT.transform(master["contract_type"])
 
-    # ── Log transforms ────────────────────────────────────────────────────────
+    # ── Log transforms (fillna before log to avoid NaN propagation) ─────────────
     for col in ["total_users", "monthly_usage_hrs", "total_revenue", "total_tickets"]:
-        master[f"log_{col}"] = np.log1p(master[col])
+        master[f"log_{col}"] = np.log1p(master[col].fillna(0))
 
     # ── Interaction features (v10: tenure_capped, log denom, has_nps_data mask) ─
     master["dunning_per_tenure"] = (
-        master["dunning_count"] / (master["tenure_capped"] / 30).replace(0, 1)
+        master["dunning_count"].fillna(0) /
+        np.where(master["tenure_capped"].fillna(1) / 30 == 0, 1, master["tenure_capped"].fillna(1) / 30)
     )
     master["usage_per_user"] = (
-        master["monthly_usage_hrs"] / master["total_users"].replace(0, 1)
+        master["monthly_usage_hrs"].fillna(0) /
+        np.where(master["total_users"].fillna(1) == 0, 1, master["total_users"].fillna(1))
     )
     master["ticket_per_revenue"] = (
-        master["total_tickets"] / (master["log_total_revenue"] + 1e-3)   # v10: log denom
+        master["total_tickets"].fillna(0) / (master["log_total_revenue"].fillna(0) + 1e-3)
     )
     master["adoption_x_usage"] = (
-        master["feature_adoption_pct"] * master["log_monthly_usage_hrs"]
+        master["feature_adoption_pct"].fillna(0) * master["log_monthly_usage_hrs"].fillna(0)
     )
-    master["nps_x_dunning"] = (                                           # v10: * has_nps_data
-        master["avg_nps_score"] * (master["dunning_count"] + 1) * master["has_nps_data"]
+    master["nps_x_dunning"] = (
+        master["avg_nps_score"].fillna(0) *
+        (master["dunning_count"].fillna(0) + 1) *
+        master["has_nps_data"].fillna(0)
     )
 
     # ── VADER / NLP features (v10: per-customer, merged back) ─────────────────
