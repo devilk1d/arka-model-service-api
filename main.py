@@ -367,19 +367,22 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
             "priority":    row["risk_level"],
         }
 
+        # centroid keys = SEG_FEATURES = ['days_since_login','payment_count',
+        # 'log_revenue','log_usage','feature_adoption_pct','avg_nps_score']
+        # total_revenue & monthly_usage_hrs exist in master row but NOT in centroid
         seg_rfm_context = {
             "days_since_login":      {"customer": round(float(row.get("days_since_login", 0)), 1),
-                                      "segment_avg": round(centroid["days_since_login"], 1)},
+                                      "segment_avg": round(float(centroid.get("days_since_login", 0)), 1)},
             "payment_count":         {"customer": round(float(row.get("payment_count", 0)), 1),
-                                      "segment_avg": round(centroid["payment_count"], 1)},
+                                      "segment_avg": round(float(centroid.get("payment_count", 0)), 1)},
             "total_revenue":         {"customer": round(float(row.get("total_revenue", 0)), 1),
-                                      "segment_avg": round(centroid["total_revenue"], 1)},
+                                      "segment_avg": round(float(np.expm1(centroid.get("log_revenue", 0))), 1)},
             "monthly_usage_hrs":     {"customer": round(float(row.get("monthly_usage_hrs", 0)), 1),
-                                      "segment_avg": round(centroid["monthly_usage_hrs"], 1)},
+                                      "segment_avg": round(float(np.expm1(centroid.get("log_usage", 0))), 1)},
             "feature_adoption_pct":  {"customer": round(float(row.get("feature_adoption_pct", 0)), 1),
-                                      "segment_avg": round(centroid["feature_adoption_pct"], 1)},
+                                      "segment_avg": round(float(centroid.get("feature_adoption_pct", 0)), 1)},
             "avg_nps_score":         {"customer": round(float(row.get("avg_nps_score", 0)), 2),
-                                      "segment_avg": round(centroid["avg_nps_score"], 2)},
+                                      "segment_avg": round(float(centroid.get("avg_nps_score", 0)), 2)},
         }
 
         results.append({
