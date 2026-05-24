@@ -846,6 +846,46 @@ async def stream_llm(system: str, user_msg: str, max_tokens: int = 600):
         yield f"[Error: {str(exc)[:80]}]"
 
 
+async def stream_llm_no_think(system: str, user_msg: str, max_tokens: int = 600):
+    """Stream tokens from LLM, filtering out <think>...</think> blocks in real-time."""
+    OPEN = "<think>"
+    CLOSE = "</think>"
+    buf = ""
+    in_think = False
+
+    async for tok in stream_llm(system, user_msg, max_tokens):
+        buf += tok
+        out = ""
+
+        while buf:
+            if in_think:
+                pos = buf.find(CLOSE)
+                if pos >= 0:
+                    buf = buf[pos + len(CLOSE):]
+                    in_think = False
+                else:
+                    keep = len(CLOSE) - 1
+                    buf = buf[-keep:] if len(buf) >= keep else buf
+                    break
+            else:
+                pos = buf.find(OPEN)
+                if pos >= 0:
+                    out += buf[:pos]
+                    buf = buf[pos + len(OPEN):]
+                    in_think = True
+                else:
+                    keep = len(OPEN) - 1
+                    out += buf[:-keep] if len(buf) >= keep else buf
+                    buf = buf[-keep:] if len(buf) >= keep else buf
+                    break
+
+        if out:
+            yield out
+
+    if buf and not in_think:
+        yield buf
+
+
 class _CustomerDataSim(BaseModel):
     customer_id:         str
     churn_score:         float
@@ -1074,6 +1114,89 @@ SCENARIO_AGENTS = [
     },
 ]
 
+# Baseline agents — run on initial simulation to analyze situation & recommend actions
+BASELINE_AGENTS = [
+    {
+        "name":  "Risk Analyst",
+        "short": "RA",
+        "color": "#ef4444",
+        "system": (
+            "You are a churn risk analyst. Review this customer's churn trajectory and top risk factors. "
+            "Write 2-3 sentences identifying the most critical risk driver and its severity. "
+            "End with one concrete, specific intervention that would most reduce churn risk. "
+            "No markdown, no bullet points. Be direct and use actual numbers from the data."
+        ),
+    },
+    {
+        "name":  "Customer Success",
+        "short": "CS",
+        "color": "#3b82f6",
+        "system": (
+            "You are a customer success manager. Analyze this customer's engagement and sentiment signals. "
+            "Write 2-3 sentences about the root cause of their disengagement and what behaviour change is needed. "
+            "End with one specific outreach or engagement action you would take this week. "
+            "No markdown, no bullet points. Reference actual metrics."
+        ),
+    },
+    {
+        "name":  "Finance Analyst",
+        "short": "FN",
+        "color": "#f59e0b",
+        "system": (
+            "You are a finance analyst. Calculate the revenue risk for this customer over the forecast horizon. "
+            "Write 2-3 sentences on the financial exposure and cost-benefit of retaining them. "
+            "End with one cost-effective retention offer with a specific dollar value or discount range. "
+            "No markdown, no bullet points. Use actual revenue numbers."
+        ),
+    },
+    {
+        "name":  "Product Manager",
+        "short": "PM",
+        "color": "#8b5cf6",
+        "system": (
+            "You are a product manager. Examine this customer's feature adoption and usage pattern. "
+            "Write 2-3 sentences on which product gaps are driving their low engagement. "
+            "End with one specific product action — feature unlock, guided tutorial, or usage incentive — "
+            "that would increase retention. No markdown, no bullet points."
+        ),
+    },
+]
+
+
+async def _extract_recommendations(ctx: str, agent_outputs: list, scenario: str = "") -> list:
+    """Extract 3-4 clickable scenario options from agent outputs."""
+    debate_text = "\n".join(f"[{o['name']}]: {o['content'][:400]}" for o in agent_outputs)
+    focus = (
+        f"The agents debated the scenario: \"{scenario}\".\n"
+        if scenario.strip() else
+        "The agents analyzed the customer's baseline churn situation.\n"
+    )
+    prompt = (
+        f"{focus}"
+        f"Based on the agent analyses below, generate exactly 4 specific, actionable intervention options "
+        f"a business analyst could simulate next. Each should be a short question or action phrase "
+        f"(20-80 characters) suitable as a scenario input, written in the same language as the agent outputs. "
+        f"Return ONLY a JSON array of 4 strings. No explanation, no markdown.\n\n"
+        f"Customer context:\n{ctx[:500]}\n\n"
+        f"Agent analyses:\n{debate_text}"
+    )
+    try:
+        raw = await call_llm(
+            "You extract intervention scenario options. Return ONLY a JSON array of 4 strings.",
+            prompt, max_tokens=300,
+        )
+        raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip()).strip()
+        start = raw.find("[")
+        end   = raw.rfind("]") + 1
+        if start >= 0 and end > start:
+            items = json.loads(raw[start:end])
+            return [str(x).strip() for x in items if str(x).strip()][:4]
+    except Exception:
+        pass
+    return []
+
+
 # Scenario JSON: produces ONLY the projection + updated metric fields (not baseline)
 _SCENARIO_UPDATE_JSON_SYSTEM = """\
 You are a customer retention analytics engine. A multi-agent team has debated an intervention \
@@ -1225,13 +1348,46 @@ async def simulate(request: SimulateRequest):
             except Exception as exc:
                 sim_data = _fallback_sim(str(exc))
 
+            # Compute trajectory-based impact: how much does churn change naturally?
+            baseline_pts = sim_data.get("baseline", [])
+            if len(baseline_pts) >= 2:
+                start_prob = baseline_pts[0].get("prob", c.churn_score)
+                end_prob   = baseline_pts[-1].get("prob", c.churn_score)
+                # Positive = churn risk reduced over horizon, Negative = worsening
+                sim_data["intervention_impact_pct"] = round(start_prob - end_prob, 2)
+
             yield f"data: {json.dumps({'type': 'data', 'payload': sim_data})}\n\n"
 
-            last_week = sim_data.get("baseline", [{}])[-1]
+            # ── Baseline agent analysis ────────────────────────────────────────
+            last_pt = baseline_pts[-1] if baseline_pts else {}
+            baseline_ctx = (
+                f"{ctx}{history_block}"
+                f"\n\nBASELINE TRAJECTORY ({horizon}w): "
+                f"Churn probability {c.churn_score:.1f}% → {last_pt.get('prob', c.churn_score):.1f}% "
+                f"at week {last_pt.get('week', horizon)}. "
+                f"Revenue at risk: ${sim_data.get('revenue_at_risk', 0):,.0f}. "
+                f"Retention window: {sim_data.get('retention_window_weeks', '?')}w."
+            )
+            agent_outputs: list[dict] = []
+            for agent in BASELINE_AGENTS:
+                yield f"data: {json.dumps({'type': 'agent_start', 'agent': agent['name'], 'short': agent['short'], 'color': agent['color']})}\n\n"
+                full_content = ""
+                async for token in stream_llm_no_think(agent["system"], baseline_ctx + "\n\nProvide your analysis.", max_tokens=350):
+                    full_content += token
+                    yield f"data: {json.dumps({'type': 'agent_token', 'agent': agent['name'], 'content': token})}\n\n"
+                agent_outputs.append({"name": agent["name"], "content": full_content})
+                yield f"data: {json.dumps({'type': 'agent_done', 'agent': agent['name']})}\n\n"
+
+            # ── Extract clickable recommendations ─────────────────────────────
+            recommendations = await _extract_recommendations(ctx, agent_outputs, scenario="")
+            if recommendations:
+                yield f"data: {json.dumps({'type': 'agent_recommendations', 'recommendations': recommendations})}\n\n"
+
+            # ── Narrative ──────────────────────────────────────────────────────
             narrative_prompt = (
                 f"{ctx}{history_block}"
                 f"\n\nChurn trajectory ({horizon}w): week-0={c.churn_score:.1f}, "
-                f"week-{last_week.get('week', horizon)}={last_week.get('prob', c.churn_score):.1f}, "
+                f"week-{last_pt.get('week', horizon)}={last_pt.get('prob', c.churn_score):.1f}, "
                 f"retention_window={sim_data.get('retention_window_weeks', '?')}w, "
                 f"revenue_at_risk=${sim_data.get('revenue_at_risk', 0):,.0f}."
             )
@@ -1254,11 +1410,16 @@ async def simulate(request: SimulateRequest):
             yield f"data: {json.dumps({'type': 'agent_start', 'agent': agent['name'], 'short': agent['short'], 'color': agent['color']})}\n\n"
             user_msg = f"{ctx}{scenario_block}{history_block}\n\nProvide your analysis."
             full_content = ""
-            async for token in stream_llm(agent["system"], user_msg, max_tokens=200):
+            async for token in stream_llm_no_think(agent["system"], user_msg, max_tokens=350):
                 full_content += token
                 yield f"data: {json.dumps({'type': 'agent_token', 'agent': agent['name'], 'content': token})}\n\n"
             agent_outputs.append({"name": agent["name"], "content": full_content})
             yield f"data: {json.dumps({'type': 'agent_done', 'agent': agent['name']})}\n\n"
+
+        # ── Extract clickable recommendations from debate ─────────────────────
+        recommendations = await _extract_recommendations(ctx, agent_outputs, scenario=request.scenario)
+        if recommendations:
+            yield f"data: {json.dumps({'type': 'agent_recommendations', 'recommendations': recommendations})}\n\n"
 
         # ── Synthesise debate → projection JSON ──────────────────────────────
         yield f"data: {json.dumps({'type': 'thinking'})}\n\n"
