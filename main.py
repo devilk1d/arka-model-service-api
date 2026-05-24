@@ -1171,8 +1171,131 @@ AGENT_SCENARIO_SYSTEMS: dict[str, str] = {
 }
 
 
-async def _extract_recommendations(ctx: str, agent_outputs: list, scenario: str = "") -> list:
-    """Extract 4 clickable scenario options from agent debate outputs."""
+def _build_contextual_fallback(
+    risk_level: str,
+    customer_profile: dict,
+    scenario: str = "",
+) -> list[str]:
+    """
+    Build 4 contextual fallback recommendations from actual customer attributes.
+    Priority order: top SHAP factors → segment → plan/contract → risk urgency.
+    """
+    segment  = customer_profile.get("segment_label", "")
+    plan     = customer_profile.get("plan_type", "")
+    contract = customer_profile.get("contract_type", "")
+    shap5    = customer_profile.get("shap_top5", [])  # list of dicts
+
+    # ── Map SHAP feature labels → concrete action strings ──────────────────────
+    _FACTOR_ACTIONS: dict[str, str] = {
+        "days since login":     "Kampanye reaktivasi login dengan demo fitur terbaru",
+        "monthly usage hrs":    "Sesi onboarding intensif untuk meningkatkan jam penggunaan",
+        "avg payment delay":    "Review opsi pembayaran dan aktifkan tagihan otomatis",
+        "feature adoption":     "Pelatihan fitur premium 1-on-1 bersama CSM selama 30 hari",
+        "adoption x usage":     "Sprint aktivasi fitur utama dengan panduan step-by-step",
+        "nps score":            "NPS recovery call dan resolusi keluhan dalam 24 jam",
+        "avg nps score":        "NPS recovery call dan resolusi keluhan dalam 24 jam",
+        "tenure days":          "Program loyalitas eksklusif dan apresiasi untuk pelanggan lama",
+        "contract type":        "Konversi ke kontrak tahunan dengan diskon 25%",
+        "plan type":            "Upgrade plan ke tier lebih tinggi dengan trial 30 hari gratis",
+        "support tickets":      "Fast-track semua tiket terbuka dan assign support prioritas",
+        "billing issues":       "Audit billing, hapus biaya tidak jelas, tawarkan kredit",
+    }
+
+    pool: list[str] = []
+    seen: set[str]  = set()
+
+    def add(rec: str) -> None:
+        if rec not in seen:
+            seen.add(rec)
+            pool.append(rec)
+
+    # ── 1. SHAP-driven recs (top factors that INCREASE churn risk) ─────────────
+    for factor in shap5[:3]:
+        label  = str(factor.get("feature_label", "")).lower()
+        shap_v = float(factor.get("shap_value", 0))
+        if shap_v <= 0:          # negative SHAP = reduces risk → skip
+            continue
+        for key, action in _FACTOR_ACTIONS.items():
+            if key in label or label in key:
+                add(action)
+                break
+
+    # ── 2. Segment-based recs ──────────────────────────────────────────────────
+    seg = segment.lower()
+    if any(x in seg for x in ("critical", "at-risk", "at risk")):
+        add("Eskalasi ke tim senior dan buat retention plan darurat 30 hari")
+        add("Hubungi decision maker langsung untuk win-back meeting")
+    elif "champion" in seg:
+        add("Tawarkan early access fitur eksklusif sebagai apresiasi loyalitas")
+        add("Program ambassador dengan benefit tambahan dan diskon renewal")
+    elif "loyalist" in seg:
+        add("Program loyalitas VIP dengan benefit eksklusif jangka panjang")
+        add("Undangan ke customer advisory board dan sesi feedback eksklusif")
+    elif any(x in seg for x in ("potential", "prospect")):
+        add("Sesi konsultasi gratis untuk temukan nilai produk yang paling relevan")
+        add("Tawarkan paket yang lebih sesuai kebutuhan saat ini dengan harga khusus")
+
+    # ── 3. Plan-based recs ─────────────────────────────────────────────────────
+    p = plan.lower()
+    if any(x in p for x in ("basic", "starter", "free")):
+        add("Upgrade ke Pro plan dengan trial 60 hari gratis tanpa komitmen")
+    elif any(x in p for x in ("enterprise", "business", "corporate")):
+        add("Assign dedicated account manager dan quarterly executive business review")
+    elif "pro" in p:
+        add("Aktifkan fitur enterprise add-on dengan harga khusus selama 3 bulan")
+
+    # ── 4. Contract-based recs ─────────────────────────────────────────────────
+    ct = contract.lower()
+    if "month" in ct:
+        add("Konversi ke kontrak tahunan dengan diskon 30% dan lock-in pricing")
+    elif any(x in ct for x in ("annual", "year")):
+        add("Perpanjang kontrak 2 tahun dengan freeze harga dan bonus kredit fitur")
+
+    # ── 5. Urgency recs by risk level ──────────────────────────────────────────
+    if risk_level == "High":
+        add("Freeze billing 2 bulan + akses semua fitur premium gratis")
+        add("Hubungi customer dalam 24 jam untuk intervensi retensi darurat")
+    elif risk_level == "Medium":
+        add("Check-in mingguan otomatis via CSM selama 8 minggu ke depan")
+        add("Tawarkan diskon 20% untuk perpanjangan kontrak 6 bulan")
+    else:
+        add("Kirim survei kepuasan dan aktifkan program referral eksklusif")
+        add("Berikan kredit bonus penggunaan sebagai apresiasi loyalitas")
+
+    # ── 6. Scenario follow-up: suggest complementary angles ───────────────────
+    if scenario.strip():
+        add("Kombinasikan intervensi di atas dengan insentif loyalitas jangka panjang")
+        add("Uji A/B: diskon harga vs peningkatan intensitas layanan CSM")
+
+    # ── Pad with safe generics if pool is still short ─────────────────────────
+    _generics = [
+        "Lakukan business review bulanan dan monitoring metrik kesehatan akun",
+        "Berikan akses fitur premium gratis selama 60 hari",
+        "Assign Customer Success Manager dedicated selama 90 hari",
+        "Tawarkan diskon 20% untuk perpanjangan kontrak 6 bulan",
+    ]
+    for g in _generics:
+        if len(pool) >= 4:
+            break
+        add(g)
+
+    return pool[:4]
+
+
+async def _extract_recommendations(
+    ctx: str,
+    agent_outputs: list,
+    scenario: str = "",
+    risk_level: str = "High",
+    customer_profile: dict | None = None,
+) -> list:
+    """
+    Extract 4 clickable scenario options.
+    Primary: LLM generates them from agent debate output.
+    Fallback: contextual recs built from real customer attributes (no LLM needed).
+    """
+    cp = customer_profile or {}
+
     debate_text = "\n".join(
         f"[{o['name']}]: {o['content'][:500]}" for o in agent_outputs
     )
@@ -1201,21 +1324,9 @@ async def _extract_recommendations(ctx: str, agent_outputs: list, scenario: str 
         f"Contoh: [\"Tawarkan diskon 20% selama 3 bulan\", \"Assign CSM dedicated\", ...]\n"
         f"Tanpa penjelasan, tanpa markdown fence, tanpa teks tambahan."
     )
-    # Fallback recommendations based on customer profile
-    _risk = getattr(c, "risk_level", "High")
-    _fallback_recs = [
-        "Tawarkan diskon 20% untuk perpanjangan kontrak 6 bulan",
-        "Assign Customer Success Manager dedicated selama 90 hari",
-        "Berikan akses fitur premium gratis selama 60 hari",
-        "Lakukan business review bulanan dan check-in mingguan",
-    ]
-    if _risk == "High":
-        _fallback_recs = [
-            "Tawarkan diskon 30% dan perpanjangan kontrak darurat",
-            "Hubungi VP/C-level langsung dalam 48 jam",
-            "Berikan dedicated onboarding ulang dengan CSM senior",
-            "Freeze billing 2 bulan + akses semua fitur enterprise",
-        ]
+
+    # Pre-build contextual fallback (zero extra LLM calls, uses real customer data)
+    _fallback_recs = _build_contextual_fallback(risk_level, cp, scenario)
 
     try:
         raw = await call_llm(
@@ -1227,7 +1338,7 @@ async def _extract_recommendations(ctx: str, agent_outputs: list, scenario: str 
         raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
         raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
         raw = re.sub(r"\s*```\s*$", "", raw, flags=re.MULTILINE).strip()
-        # Try multiple extraction strategies
+        # Strategy 1: parse full JSON array
         start = raw.find("[")
         end   = raw.rfind("]") + 1
         if start >= 0 and end > start:
@@ -1235,12 +1346,13 @@ async def _extract_recommendations(ctx: str, agent_outputs: list, scenario: str 
             cleaned = [str(x).strip() for x in items if str(x).strip()]
             if len(cleaned) >= 2:
                 return cleaned[:4]
-        # Try extracting quoted strings as fallback
+        # Strategy 2: extract quoted strings
         quoted = re.findall(r'"([^"]{10,100})"', raw)
         if len(quoted) >= 2:
             return quoted[:4]
     except Exception:
         pass
+
     return _fallback_recs
 
 
@@ -1475,7 +1587,17 @@ async def simulate(request: SimulateRequest):
             agent_outputs = getattr(_run_agents, "_last_outputs", [])
 
             # Extract recommendations
-            recs = await _extract_recommendations(ctx, agent_outputs, scenario="")
+            recs = await _extract_recommendations(
+                ctx, agent_outputs, scenario="",
+                risk_level=c.risk_level,
+                customer_profile={
+                    "segment_label":  c.segment_label,
+                    "plan_type":      c.plan_type,
+                    "contract_type":  c.contract_type,
+                    "churn_score":    c.churn_score,
+                    "shap_top5":      c.shap_top5,
+                },
+            )
             if recs:
                 yield f"data: {json.dumps({'type': 'agent_recommendations', 'recommendations': recs})}\n\n"
 
@@ -1510,7 +1632,17 @@ async def simulate(request: SimulateRequest):
         agent_outputs_s = getattr(_run_agents, "_last_outputs", [])
 
         # Extract follow-up recommendations
-        recs = await _extract_recommendations(ctx, agent_outputs_s, scenario=request.scenario)
+        recs = await _extract_recommendations(
+            ctx, agent_outputs_s, scenario=request.scenario,
+            risk_level=c.risk_level,
+            customer_profile={
+                "segment_label":  c.segment_label,
+                "plan_type":      c.plan_type,
+                "contract_type":  c.contract_type,
+                "churn_score":    c.churn_score,
+                "shap_top5":      c.shap_top5,
+            },
+        )
         if recs:
             yield f"data: {json.dumps({'type': 'agent_recommendations', 'recommendations': recs})}\n\n"
 
