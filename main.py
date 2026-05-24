@@ -801,93 +801,9 @@ async def predict_single(
     return r
 
 
-# ─── Simulation: Multi-Agent Debate ───────────────────────────────────────────
+# ─── Simulation: Churn Trajectory ────────────────────────────────────────────
 
 from fastapi.responses import StreamingResponse  # noqa: E402
-
-_NO_MD = (
-    "JANGAN gunakan markdown, asterisk (*), tanda bintang, double asterisk (**), "
-    "bullet points, atau formatting apapun. Tulis teks biasa seperti percakapan natural."
-)
-
-AGENT_ORDER = ["Risk Analyst", "Customer Success Manager", "Product Manager", "Finance Analyst"]
-
-AGENT_PERSONAS: dict = {
-    "Risk Analyst": {
-        "color": "#ef4444",
-        "r1": (
-            f"Anda adalah Risk Analyst senior. Fokus: churn score, faktor SHAP, dan dampak risiko bisnis. "
-            f"Berikan analisis awal 2-3 kalimat. Bahasa Indonesia. {_NO_MD}"
-        ),
-        "r2": (
-            f"Anda adalah Risk Analyst senior. Baca argumen rekan tim lalu respond: setuju, tidak setuju, atau tambahkan sudut pandang risiko yang terlewat. "
-            f"2-3 kalimat. Bahasa Indonesia. {_NO_MD}"
-        ),
-        "chat": (
-            f"Anda adalah Risk Analyst senior. Jawab pertanyaan user dari perspektif risiko dan data. "
-            f"Singkat, 1-2 kalimat. Bahasa Indonesia. {_NO_MD}"
-        ),
-    },
-    "Customer Success Manager": {
-        "color": "#3b82f6",
-        "r1": (
-            f"Anda adalah Customer Success Manager senior. Fokus: sentimen customer, feedback, dan hubungan jangka panjang. "
-            f"Berikan perspektif awal 2-3 kalimat. Bahasa Indonesia. {_NO_MD}"
-        ),
-        "r2": (
-            f"Anda adalah Customer Success Manager senior. Respond terhadap argumen rekan: dukung, bantah, atau perjelas dari sudut pandang customer. "
-            f"2-3 kalimat. Bahasa Indonesia. {_NO_MD}"
-        ),
-        "chat": (
-            f"Anda adalah Customer Success Manager senior. Jawab pertanyaan user dari perspektif hubungan dan kepuasan customer. "
-            f"Singkat, 1-2 kalimat. Bahasa Indonesia. {_NO_MD}"
-        ),
-    },
-    "Product Manager": {
-        "color": "#8b5cf6",
-        "r1": (
-            f"Anda adalah Product Manager senior. Fokus: feature adoption, usage pattern, dan gap antara value ditawarkan vs dirasakan customer. "
-            f"Analisis awal 2-3 kalimat. Bahasa Indonesia. {_NO_MD}"
-        ),
-        "r2": (
-            f"Anda adalah Product Manager senior. Baca argumen tim lalu respond: apa yang didukung, dibantah, atau ditambahkan dari sudut product. "
-            f"2-3 kalimat. Bahasa Indonesia. {_NO_MD}"
-        ),
-        "chat": (
-            f"Anda adalah Product Manager senior. Jawab pertanyaan user dari perspektif product dan adoption. "
-            f"Singkat, 1-2 kalimat. Bahasa Indonesia. {_NO_MD}"
-        ),
-    },
-    "Finance Analyst": {
-        "color": "#f59e0b",
-        "r1": (
-            f"Anda adalah Finance Analyst senior. Fokus: revenue, CLV, payment behavior, dan ROI dari skenario yang dibahas. "
-            f"Analisis finansial awal 2-3 kalimat. Bahasa Indonesia. {_NO_MD}"
-        ),
-        "r2": (
-            f"Anda adalah Finance Analyst senior. Respond argumen rekan dari sudut finansial: apakah cost-benefit mendukung atau menentang rekomendasi mereka. "
-            f"2-3 kalimat. Bahasa Indonesia. {_NO_MD}"
-        ),
-        "chat": (
-            f"Anda adalah Finance Analyst senior. Jawab pertanyaan user dari sudut finansial dan ROI. "
-            f"Singkat, 1-2 kalimat. Bahasa Indonesia. {_NO_MD}"
-        ),
-    },
-    "Moderator": {
-        "color": "#10b981",
-        "system": (
-            "Anda adalah Chief Customer Officer. Sintesis seluruh debat dan buat keputusan final. "
-            "Output HARUS berupa JSON valid tanpa teks lain, tanpa markdown, tanpa komentar:\n"
-            '{"kesimpulan":"2-3 kalimat keputusan final",'
-            '"churn_score_before":0,"churn_score_after":0,"confidence":0,'
-            '"prioritas_aksi":["aksi 1","aksi 2","aksi 3"],'
-            '"timeline":"estimasi waktu melihat hasil intervensi",'
-            '"expected_feedback":"prediksi respons/perilaku customer setelah intervensi",'
-            '"risk_jika_tidak_ditangani":"konsekuensi bisnis jika tidak ada aksi"}'
-        ),
-    },
-}
-
 
 async def stream_llm(system: str, user_msg: str, max_tokens: int = 600):
     """Stream tokens from LLM via OpenAI-compatible SSE."""
@@ -946,22 +862,16 @@ class _CustomerDataSim(BaseModel):
 
 class SimulateRequest(BaseModel):
     customer_data: _CustomerDataSim
-    scenario:      str = ""   # optional: describe a planned intervention scenario
-    user_prompt:   str = ""   # optional: extra context/question for agents
-
-
-class SimulateChatRequest(BaseModel):
-    customer_data:  _CustomerDataSim
-    debate_context: list       # [{agent, content, round}]
-    question:       str
-    scenario:       str = ""
+    scenario:      str        = ""   # optional: intervention scenario for projection
+    chat_history:  list[dict] = []   # [{question, narrative}] — prior turns
 
 
 def _build_ctx(c: _CustomerDataSim, scenario: str) -> str:
+    """Build a compact customer context string for LLM prompts."""
     rfm      = c.segment_rfm_context
     shap_txt = "\n".join(
         f"  - {f['feature_label']}: {f['shap_value']:+.3f} "
-        f"({'meningkatkan' if f['direction'] == 'increases_churn' else 'menurunkan'} risiko)"
+        f"({'increases' if f['direction'] == 'increases_churn' else 'decreases'} churn risk)"
         for f in c.shap_top5
     )
     rev      = rfm.get("total_revenue",       {}).get("customer", 0)
@@ -971,169 +881,201 @@ def _build_ctx(c: _CustomerDataSim, scenario: str) -> str:
     dsl      = rfm.get("days_since_login",     {}).get("customer", 0)
     ctx = (
         f"CUSTOMER: {c.customer_id} | Plan: {c.plan_type} ({c.contract_type}) | Segment: {c.segment_label}\n"
-        f"Churn Score: {c.churn_score}/100 | Risk: {c.risk_level}\n"
+        f"Churn Score: {c.churn_score:.1f}/100 | Risk Level: {c.risk_level}\n"
         f"Revenue: ${rev:,.0f}/mo | Usage: {usage:.0f}h/mo | Feature Adoption: {adoption:.0f}% | NPS: {nps:.1f}/10\n"
-        f"Days since login: {dsl:.0f}\n"
+        f"Days since last login: {dsl:.0f}\n"
         f"Sentiment: {c.sentiment.get('label', 'N/A')} "
         f"(VADER: {c.sentiment.get('vader_compound', 0):+.3f}) | "
         f"Urgency: {c.sentiment.get('urgency_level', 'N/A')}\n"
-        f"Feedback: \"{c.sentiment.get('feedback_preview', '')[:200]}\"\n"
-        f"NLP Red Flag: {'Ya' if c.nlp_red_flag else 'Tidak'} | "
-        f"Loyalty Risk: {'Ya' if c.loyalty_risk_flag else 'Tidak'}\n\n"
-        f"FAKTOR UTAMA (SHAP):\n{shap_txt}"
+        f"Feedback preview: \"{c.sentiment.get('feedback_preview', '')[:200]}\"\n"
+        f"NLP Red Flag: {'Yes' if c.nlp_red_flag else 'No'} | "
+        f"Loyalty Risk: {'Yes' if c.loyalty_risk_flag else 'No'}\n\n"
+        f"TOP CHURN DRIVERS (SHAP):\n{shap_txt}"
     )
     if scenario.strip():
-        ctx += f"\n\nSKENARIO YANG DIPERTIMBANGKAN:\n{scenario}"
+        ctx += f"\n\nINTERVENTION SCENARIO BEING EVALUATED:\n{scenario}"
     return ctx
+
+
+async def call_llm(system: str, user_msg: str, max_tokens: int = 1200) -> str:
+    """Non-streaming LLM call; returns the full response text."""
+    _raw_url = os.getenv("OLLAMA_URL", "https://api.openai.com/v1")
+    if not _raw_url.startswith("http"):
+        _raw_url = f"https://{_raw_url}"
+    base_url = _raw_url.rstrip("/")
+    endpoint = f"{base_url}/chat/completions"
+
+    headers = {"Content-Type": "application/json"}
+    if LLM_KEY:
+        headers["Authorization"] = f"Bearer {LLM_KEY}"
+
+    payload = {
+        "model":       LLM_MODEL,
+        "messages":    [{"role": "system", "content": system}, {"role": "user", "content": user_msg}],
+        "stream":      False,
+        "temperature": 0.4,
+        "max_tokens":  max_tokens,
+    }
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(endpoint, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["message"]["content"]
+
+
+_SIM_JSON_SYSTEM = """\
+You are a customer retention analytics engine. Given a customer's churn data, \
+produce a precise JSON churn trajectory forecast. No prose — output ONLY valid JSON.
+
+The JSON schema (all fields required):
+{
+  "baseline": [
+    {"week": 0, "prob": <ACTUAL_CHURN_SCORE_0_TO_100>},
+    {"week": 2, "prob": <float 0-100>},
+    {"week": 4, "prob": <float 0-100>},
+    {"week": 6, "prob": <float 0-100>},
+    {"week": 8, "prob": <float 0-100>},
+    {"week": 10, "prob": <float 0-100>},
+    {"week": 12, "prob": <float 0-100>}
+  ],
+  "projection": null,
+  "retention_window_weeks": <int: estimated weeks before churn probability exceeds 80>,
+  "revenue_at_risk": <float: monthly_revenue * (churn_prob/100) * 3>,
+  "confidence": <float 0.0-1.0>,
+  "intervention_impact_pct": null,
+  "segment_migration": [
+    {"label": "Churned", "prob": <float 0.0-1.0>},
+    {"label": "High Risk", "prob": <float 0.0-1.0>},
+    {"label": "At Risk", "prob": <float 0.0-1.0>},
+    {"label": "Retained", "prob": <float 0.0-1.0>}
+  ]
+}
+
+Rules:
+- baseline[0].prob MUST equal the actual churn_score from the customer data exactly.
+- If a scenario is provided, also fill "projection" with the same 7-point structure \
+  (week 0 same as baseline[0]), and fill "intervention_impact_pct" with the estimated \
+  churn reduction percentage (positive number).
+- segment_migration probs must sum to 1.0.
+- retention_window_weeks: how many weeks until baseline churn probability crosses 80. \
+  If already above 80, set to 0. If it never crosses 80 in 12 weeks, set to 13.
+- revenue_at_risk: monthly revenue × (week-6 churn_prob / 100) × 3.
+"""
+
+_SIM_NARRATIVE_SYSTEM = """\
+You are a senior customer success analyst writing a concise retention briefing. \
+Write 3-4 sentences in Indonesian (Bahasa Indonesia) that summarise:
+1. The customer's current churn risk situation
+2. The key drivers behind this trajectory
+3. The most important recommended action
+
+Be direct and specific. Reference actual numbers from the data. No bullet points — \
+flowing prose only. Max 120 words.
+"""
 
 
 @app.post("/simulate")
 async def simulate(request: SimulateRequest):
-    """Two-round multi-agent debate SSE. Moderator synthesises silently at the end."""
-    ctx   = _build_ctx(request.customer_data, request.scenario)
-    extra = f"\n\nKonteks tambahan: {request.user_prompt}" if request.user_prompt.strip() else ""
+    """
+    Churn trajectory simulation SSE.
+    Step 1: call_llm → emit 'data' event with chart/metrics JSON.
+    Step 2: stream_llm → emit 'token' events for narrative.
+    Step 3: emit 'done'.
+    """
+    c   = request.customer_data
+    ctx = _build_ctx(c, request.scenario)
+
+    # Append prior chat turns for follow-up scenarios
+    history_block = ""
+    if request.chat_history:
+        lines = [
+            f"Q: {turn.get('question', '')}\nA (summary): {str(turn.get('narrative', ''))[:300]}"
+            for turn in request.chat_history[-4:]
+        ]
+        history_block = "\n\nPREVIOUS CONVERSATION TURNS:\n" + "\n\n".join(lines)
 
     async def event_stream():
-        all_msgs: list[dict] = []
+        # ── Step 1: Structured JSON data ─────────────────────────────────────
+        yield f"data: {json.dumps({'type': 'thinking'})}\n\n"
 
-        # ── Round 1: Initial analysis ─────────────────────────────────────────
-        yield f"data: {json.dumps({'type': 'round_start', 'round': 1, 'label': 'Analisis Awal'})}\n\n"
-
-        for agent_name in AGENT_ORDER:
-            persona  = AGENT_PERSONAS[agent_name]
-            # Each agent in Round 1 sees what earlier agents said in this round
-            history  = (
-                "\n\nArgumen rekan sebelumnya:\n"
-                + "\n\n".join(f"[{m['agent']}]: {m['content']}" for m in all_msgs)
-            ) if all_msgs else ""
-            user_msg = f"{ctx}{history}{extra}\n\nBerikan analisis awal Anda."
-
-            yield f"data: {json.dumps({'type': 'agent_start', 'agent': agent_name, 'color': persona['color'], 'round': 1})}\n\n"
-            full = ""
-            async for token in stream_llm(persona["r1"], user_msg):
-                full += token
-                yield f"data: {json.dumps({'type': 'token', 'agent': agent_name, 'content': token})}\n\n"
-            all_msgs.append({"agent": agent_name, "content": full, "round": 1})
-            yield f"data: {json.dumps({'type': 'agent_done', 'agent': agent_name, 'round': 1})}\n\n"
-
-        yield f"data: {json.dumps({'type': 'round_end', 'round': 1})}\n\n"
-
-        # ── Round 2: Rebuttal ─────────────────────────────────────────────────
-        yield f"data: {json.dumps({'type': 'round_start', 'round': 2, 'label': 'Debat & Respons'})}\n\n"
-
-        r1_block = "\n\nARGUMEN RONDE PERTAMA:\n" + "\n\n".join(
-            f"[{m['agent']}]: {m['content']}" for m in all_msgs if m["round"] == 1
-        )
-
-        for agent_name in AGENT_ORDER:
-            persona  = AGENT_PERSONAS[agent_name]
-            user_msg = (
-                f"{ctx}{r1_block}{extra}"
-                f"\n\nRespond terhadap argumen rekan dari perspektif {agent_name}. "
-                f"Setuju, tidak setuju, atau tambahkan hal yang belum dibahas."
+        sim_data: dict = {}
+        try:
+            raw = await call_llm(
+                _SIM_JSON_SYSTEM,
+                f"{ctx}{history_block}\n\nGenerate the churn trajectory JSON now.",
+                max_tokens=900,
             )
-            yield f"data: {json.dumps({'type': 'agent_start', 'agent': agent_name, 'color': persona['color'], 'round': 2})}\n\n"
-            full = ""
-            async for token in stream_llm(persona["r2"], user_msg):
-                full += token
-                yield f"data: {json.dumps({'type': 'token', 'agent': agent_name, 'content': token})}\n\n"
-            all_msgs.append({"agent": agent_name, "content": full, "round": 2})
-            yield f"data: {json.dumps({'type': 'agent_done', 'agent': agent_name, 'round': 2})}\n\n"
-
-        yield f"data: {json.dumps({'type': 'round_end', 'round': 2})}\n\n"
-
-        # ── Send debate store first (small separate event) ───────────────────
-        yield f"data: {json.dumps({'type': 'debate_store', 'debate': all_msgs})}\n\n"
-
-        # ── Moderator: silent token collection via stream_llm ────────────────
-        yield f"data: {json.dumps({'type': 'moderator_thinking'})}\n\n"
-
-        mod         = AGENT_PERSONAS["Moderator"]
-        full_debate = "\n\nSELURUH DEBAT:\n" + "\n\n".join(
-            f"[{m['agent']} - Ronde {m['round']}]: {m['content']}" for m in all_msgs
-        )
-        user_msg_mod = (
-            f"{ctx}{full_debate}"
-            f"\n\nSintesis semua argumen di atas dan berikan keputusan final dalam format JSON."
-        )
-
-        # Collect tokens silently — larger token budget for JSON synthesis
-        full_mod = ""
-        try:
-            async for token in stream_llm(mod["system"], user_msg_mod, max_tokens=2000):
-                full_mod += token
-        except Exception:
-            full_mod = ""
-
-        # Robust JSON extraction: strip <think>, code fences, then find first { to last }
-        conclusion: dict = {}
-        try:
-            cleaned = re.sub(r"<think>.*?</think>", "", full_mod, flags=re.DOTALL).strip()
+            cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
             cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.MULTILINE)
             cleaned = re.sub(r"```\s*$", "", cleaned, flags=re.MULTILINE).strip()
-            # Extract the outermost JSON object even if model added prose around it
             start = cleaned.find("{")
             end   = cleaned.rfind("}") + 1
             if start != -1 and end > start:
-                conclusion = json.loads(cleaned[start:end])
+                sim_data = json.loads(cleaned[start:end])
             else:
-                raise ValueError("no JSON object found")
-        except Exception:
-            conclusion = {
-                "kesimpulan":                full_mod.strip() or "Moderator tidak dapat mensintesis kesimpulan.",
-                "churn_score_before":        request.customer_data.churn_score,
-                "churn_score_after":         max(0.0, request.customer_data.churn_score - 15),
-                "confidence":                0.5,
-                "prioritas_aksi":            ["Hubungi customer segera", "Evaluasi ulang kebutuhan customer"],
-                "timeline":                  "1-2 minggu",
-                "expected_feedback":         "Customer membutuhkan perhatian segera",
-                "risk_jika_tidak_ditangani": "Risiko churn tinggi dalam 30 hari ke depan",
+                raise ValueError("no JSON object found in LLM response")
+
+            # Ensure week-0 is pinned to actual churn_score
+            if sim_data.get("baseline") and len(sim_data["baseline"]) > 0:
+                sim_data["baseline"][0]["prob"] = round(c.churn_score, 2)
+
+        except Exception as exc:
+            # Fallback: synthetic trajectory based on churn_score
+            base_score = c.churn_score
+            decay = 1.05 if base_score > 60 else 1.02
+            sim_data = {
+                "baseline": [
+                    {"week": 0,  "prob": round(base_score, 2)},
+                    {"week": 2,  "prob": round(min(100, base_score * decay),       2)},
+                    {"week": 4,  "prob": round(min(100, base_score * decay**2),    2)},
+                    {"week": 6,  "prob": round(min(100, base_score * decay**3),    2)},
+                    {"week": 8,  "prob": round(min(100, base_score * decay**4),    2)},
+                    {"week": 10, "prob": round(min(100, base_score * decay**5),    2)},
+                    {"week": 12, "prob": round(min(100, base_score * decay**6),    2)},
+                ],
+                "projection": None,
+                "retention_window_weeks": max(0, int((80 - base_score) / (base_score * (decay - 1) + 0.5))),
+                "revenue_at_risk": round(
+                    c.segment_rfm_context.get("total_revenue", {}).get("customer", 0)
+                    * (min(100, base_score * decay**3) / 100) * 3, 2
+                ),
+                "confidence": 0.6,
+                "intervention_impact_pct": None,
+                "segment_migration": [
+                    {"label": "Churned",   "prob": round(base_score / 100 * 0.7,        3)},
+                    {"label": "High Risk", "prob": round(base_score / 100 * 0.2,        3)},
+                    {"label": "At Risk",   "prob": round((1 - base_score / 100) * 0.4,  3)},
+                    {"label": "Retained",  "prob": round((1 - base_score / 100) * 0.6,  3)},
+                ],
+                "_error": str(exc)[:120],
             }
 
-        # Debug event — visible in frontend debug panel
-        yield f"data: {json.dumps({'type': 'debug', 'full_mod_len': len(full_mod), 'conclusion_keys': list(conclusion.keys())})}\n\n"
+        yield f"data: {json.dumps({'type': 'data', 'payload': sim_data})}\n\n"
 
-        # Emit conclusion without debate (already sent as debate_store above)
-        yield f"data: {json.dumps({'type': 'conclusion', 'data': conclusion})}\n\n"
-        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        # ── Step 2: Streaming narrative ───────────────────────────────────────
+        scenario_note = (
+            f"\n\nScenario being evaluated: {request.scenario}"
+            if request.scenario.strip() else ""
+        )
+        narrative_prompt = (
+            f"{ctx}{scenario_note}{history_block}"
+            f"\n\nChurn trajectory summary: week-0={c.churn_score:.1f}, "
+            f"week-12={sim_data.get('baseline', [{}])[-1].get('prob', c.churn_score):.1f}, "
+            f"retention_window={sim_data.get('retention_window_weeks', '?')} weeks, "
+            f"revenue_at_risk=${sim_data.get('revenue_at_risk', 0):,.0f}."
+        )
 
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
-    )
+        full_narrative = ""
+        async for token in stream_llm(_SIM_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=250):
+            full_narrative += token
+            yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
 
-
-@app.post("/simulate/chat")
-async def simulate_chat(request: SimulateChatRequest):
-    """Post-simulation Q&A: all 4 analyst agents answer the user's question briefly."""
-    ctx = _build_ctx(request.customer_data, request.scenario)
-    debate_summary = "\n\nRINGKASAN DEBAT SEBELUMNYA:\n" + "\n\n".join(
-        f"[{m['agent']} Ronde {m.get('round', 1)}]: {str(m['content'])[:300]}"
-        for m in request.debate_context[-8:]
-    )
-
-    async def event_stream():
-        yield f"data: {json.dumps({'type': 'chat_start', 'question': request.question})}\n\n"
-
-        for agent_name in AGENT_ORDER:
-            persona  = AGENT_PERSONAS[agent_name]
-            user_msg = (
-                f"{ctx}{debate_summary}"
-                f"\n\nPertanyaan: {request.question}"
-                f"\n\nJawab dari perspektif {agent_name}."
-            )
-            yield f"data: {json.dumps({'type': 'agent_start', 'agent': agent_name, 'color': persona['color'], 'is_chat': True})}\n\n"
-            full = ""
-            async for token in stream_llm(persona["chat"], user_msg):
-                full += token
-                yield f"data: {json.dumps({'type': 'token', 'agent': agent_name, 'content': token})}\n\n"
-            yield f"data: {json.dumps({'type': 'agent_done', 'agent': agent_name, 'is_chat': True})}\n\n"
-
-        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        yield f"data: {json.dumps({'type': 'done', 'narrative': full_narrative})}\n\n"
 
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
+
