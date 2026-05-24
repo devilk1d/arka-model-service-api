@@ -418,6 +418,7 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
             # ── NLP flags (v10 new) ────────────────────────────────────────────
             "nlp_red_flag":         int(row["nlp_red_flag"]),
             "loyalty_risk_flag":    int(row["loyalty_risk_flag"]),
+            "has_nps_data":         int(row["has_nps_data"]),
 
             # ── Segmentation ───────────────────────────────────────────────────
             "segment_label":        seg,
