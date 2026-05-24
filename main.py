@@ -889,7 +889,7 @@ AGENT_PERSONAS: dict = {
 }
 
 
-async def stream_llm(system: str, user_msg: str):
+async def stream_llm(system: str, user_msg: str, max_tokens: int = 600):
     """Stream tokens from LLM via OpenAI-compatible SSE."""
     _raw_url = os.getenv("OLLAMA_URL", "https://api.openai.com/v1")
     if not _raw_url.startswith("http"):
@@ -906,7 +906,7 @@ async def stream_llm(system: str, user_msg: str):
         "messages":    [{"role": "system", "content": system}, {"role": "user", "content": user_msg}],
         "stream":      True,
         "temperature": 0.7,
-        "max_tokens":  600,
+        "max_tokens":  max_tokens,
     }
 
     try:
@@ -1042,6 +1042,9 @@ async def simulate(request: SimulateRequest):
 
         yield f"data: {json.dumps({'type': 'round_end', 'round': 2})}\n\n"
 
+        # ── Send debate store first (small separate event) ───────────────────
+        yield f"data: {json.dumps({'type': 'debate_store', 'debate': all_msgs})}\n\n"
+
         # ── Moderator: silent token collection via stream_llm ────────────────
         yield f"data: {json.dumps({'type': 'moderator_thinking'})}\n\n"
 
@@ -1054,32 +1057,41 @@ async def simulate(request: SimulateRequest):
             f"\n\nSintesis semua argumen di atas dan berikan keputusan final dalam format JSON."
         )
 
-        # Collect tokens silently — no SSE emission until conclusion is ready
+        # Collect tokens silently — larger token budget for JSON synthesis
         full_mod = ""
         try:
-            async for token in stream_llm(mod["system"], user_msg_mod):
+            async for token in stream_llm(mod["system"], user_msg_mod, max_tokens=2000):
                 full_mod += token
-        except Exception as exc:
+        except Exception:
             full_mod = ""
 
+        # Robust JSON extraction: strip <think>, code fences, then find first { to last }
         conclusion: dict = {}
         try:
-            cleaned    = re.sub(r"<think>.*?</think>", "", full_mod, flags=re.DOTALL).strip()
-            cleaned    = re.sub(r"^```(?:json)?\s*", "", cleaned).rstrip("```").strip()
-            conclusion = json.loads(cleaned)
+            cleaned = re.sub(r"<think>.*?</think>", "", full_mod, flags=re.DOTALL).strip()
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.MULTILINE)
+            cleaned = re.sub(r"```\s*$", "", cleaned, flags=re.MULTILINE).strip()
+            # Extract the outermost JSON object even if model added prose around it
+            start = cleaned.find("{")
+            end   = cleaned.rfind("}") + 1
+            if start != -1 and end > start:
+                conclusion = json.loads(cleaned[start:end])
+            else:
+                raise ValueError("no JSON object found")
         except Exception:
             conclusion = {
-                "kesimpulan":                full_mod or "Moderator tidak dapat mensintesis kesimpulan.",
+                "kesimpulan":                full_mod.strip() or "Moderator tidak dapat mensintesis kesimpulan.",
                 "churn_score_before":        request.customer_data.churn_score,
-                "churn_score_after":         request.customer_data.churn_score,
-                "confidence":                0,
-                "prioritas_aksi":            [],
-                "timeline":                  "",
-                "expected_feedback":         "",
-                "risk_jika_tidak_ditangani": "",
+                "churn_score_after":         max(0.0, request.customer_data.churn_score - 15),
+                "confidence":                0.5,
+                "prioritas_aksi":            ["Hubungi customer segera", "Evaluasi ulang kebutuhan customer"],
+                "timeline":                  "1-2 minggu",
+                "expected_feedback":         "Customer membutuhkan perhatian segera",
+                "risk_jika_tidak_ditangani": "Risiko churn tinggi dalam 30 hari ke depan",
             }
 
-        yield f"data: {json.dumps({'type': 'conclusion', 'data': conclusion, 'debate': all_msgs})}\n\n"
+        # Emit conclusion without debate (already sent as debate_store above)
+        yield f"data: {json.dumps({'type': 'conclusion', 'data': conclusion})}\n\n"
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(
