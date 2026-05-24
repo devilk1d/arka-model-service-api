@@ -1045,10 +1045,14 @@ The JSON schema (all fields required):
 Rules:
 - baseline[0].prob MUST equal the actual churn_score from the customer data exactly.
 - The forecast spans {horizon_weeks} weeks ({horizon_weeks // 4} months). \
-  Generate realistic churn evolution over this full period based on the customer's risk factors.
-- If a scenario is provided, also fill "projection" with the same time-point structure \
-  (week 0 same as baseline[0]), and fill "intervention_impact_pct" with the estimated \
-  churn reduction percentage (positive number).
+  Generate realistic churn evolution based on the customer's specific risk factors (SHAP values, \
+  usage, NPS, sentiment). High-risk drivers cause upward pressure; positive signals allow decay.
+- CRITICAL — THE TRAJECTORY MUST NOT BE FLAT. You MUST generate meaningful variation:
+  * If churn_score >= 85: baseline should oscillate ±5-15 points but generally remain high. \
+    Show some natural fluctuation (e.g. 98→95→97→92→94 over the period). NEVER keep all values at 100.
+  * If churn_score 60-84: show gradual increase of 5-20 points over the horizon with variation.
+  * If churn_score < 60: show moderate increase or plateau with slight variation.
+  * Final value should differ from week-0 by at least 5 percentage points.
 - segment_migration probs must sum to 1.0. {seg_note}.
 - retention_window_weeks: weeks until baseline churn probability crosses 80. \
   If already above 80 at week 0, set to 0. \
@@ -1197,26 +1201,47 @@ async def _extract_recommendations(ctx: str, agent_outputs: list, scenario: str 
         f"Contoh: [\"Tawarkan diskon 20% selama 3 bulan\", \"Assign CSM dedicated\", ...]\n"
         f"Tanpa penjelasan, tanpa markdown fence, tanpa teks tambahan."
     )
+    # Fallback recommendations based on customer profile
+    _risk = getattr(c, "risk_level", "High")
+    _fallback_recs = [
+        "Tawarkan diskon 20% untuk perpanjangan kontrak 6 bulan",
+        "Assign Customer Success Manager dedicated selama 90 hari",
+        "Berikan akses fitur premium gratis selama 60 hari",
+        "Lakukan business review bulanan dan check-in mingguan",
+    ]
+    if _risk == "High":
+        _fallback_recs = [
+            "Tawarkan diskon 30% dan perpanjangan kontrak darurat",
+            "Hubungi VP/C-level langsung dalam 48 jam",
+            "Berikan dedicated onboarding ulang dengan CSM senior",
+            "Freeze billing 2 bulan + akses semua fitur enterprise",
+        ]
+
     try:
         raw = await call_llm(
-            "Extract 4 intervention scenario options. Return ONLY a JSON array of 4 strings.",
+            "Buat 4 opsi skenario intervensi. Kembalikan HANYA array JSON berisi 4 string.",
             prompt,
-            max_tokens=400,
+            max_tokens=450,
         )
         # Strip think blocks and fences
         raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
         raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
         raw = re.sub(r"\s*```\s*$", "", raw, flags=re.MULTILINE).strip()
+        # Try multiple extraction strategies
         start = raw.find("[")
         end   = raw.rfind("]") + 1
         if start >= 0 and end > start:
             items = json.loads(raw[start:end])
             cleaned = [str(x).strip() for x in items if str(x).strip()]
-            if cleaned:
+            if len(cleaned) >= 2:
                 return cleaned[:4]
+        # Try extracting quoted strings as fallback
+        quoted = re.findall(r'"([^"]{10,100})"', raw)
+        if len(quoted) >= 2:
+            return quoted[:4]
     except Exception:
         pass
-    return []
+    return _fallback_recs
 
 
 # ─── Scenario JSON system prompt ──────────────────────────────────────────────
@@ -1321,12 +1346,26 @@ async def simulate(request: SimulateRequest):
         _fallback_points.append(horizon)
 
     def _fallback_sim(exc_msg: str = "") -> dict:
-        base_score  = c.churn_score
-        decay       = 1.05 if base_score > 60 else 1.02
-        baseline    = [
-            {"week": w, "prob": round(min(100, base_score * decay ** i), 2)}
-            for i, w in enumerate(_fallback_points)
-        ]
+        import math, random
+        base_score = c.churn_score
+        rng = random.Random(hash(c.customer_id) % (2**31))  # deterministic per customer
+        baseline = []
+        cur = base_score
+        for i, w in enumerate(_fallback_points):
+            if i == 0:
+                baseline.append({"week": w, "prob": round(cur, 2)})
+                continue
+            if base_score >= 85:
+                # High risk: slight oscillation but staying elevated
+                delta = rng.uniform(-3, 5) - 1.5  # slight downward trend with noise
+                cur = max(72, min(99, cur + delta))
+            elif base_score >= 60:
+                delta = rng.uniform(0.5, 2.5)
+                cur = min(98, cur + delta)
+            else:
+                delta = rng.uniform(-0.5, 1.5)
+                cur = max(5, min(80, cur + delta))
+            baseline.append({"week": w, "prob": round(cur, 2)})
         mid_prob    = min(100, base_score * decay ** (len(_fallback_points) // 2))
         monthly_rev = c.segment_rfm_context.get("total_revenue", {}).get("customer", 0)
         if seg_lbls and len(seg_lbls) >= 2:
