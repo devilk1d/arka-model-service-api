@@ -557,9 +557,9 @@ Balas dengan JSON persis seperti ini:
 }}"""
 
 
-async def call_llm(prompt: str) -> str:
+async def _call_llm_xai(prompt: str) -> str:
     """
-    Call OpenAI-compatible chat API (LLM inference).
+    Call OpenAI-compatible chat API for XAI/predict endpoints (single-prompt, JSON mode).
     Supports both native Ollama (/api/chat) and OpenAI-compatible (/chat/completions).
     """
     _raw_url = os.getenv("OLLAMA_URL", "https://api.openai.com/v1")
@@ -666,7 +666,7 @@ async def generate_cohort_xai(segments: list[SegmentCohortRequest]):
             offer_actions   = seg.offer_actions,
             total_customers = seg.total_all_customers or total,
         )
-        results[seg.segment_label] = await call_llm(prompt)
+        results[seg.segment_label] = await _call_llm_xai(prompt)
     return {"status": "success", "cohort_xai": results}
 
 
@@ -719,8 +719,8 @@ async def predict(
 
     if generate_xai:
         for r in results:
-            r["xai_churn_explanation"]   = await call_llm(build_churn_xai_prompt(r))
-            r["xai_segment_explanation"] = await call_llm(build_segment_xai_prompt(r))
+            r["xai_churn_explanation"]   = await _call_llm_xai(build_churn_xai_prompt(r))
+            r["xai_segment_explanation"] = await _call_llm_xai(build_segment_xai_prompt(r))
 
         # ── Per-segment cohort narratives (new in v10) ─────────────────────────
         # Aggregate segment stats from results, then call LLM once per segment
@@ -743,7 +743,7 @@ async def predict(
                 offer_actions   = seg_act.get("offer", []),
                 total_customers = total_customers,
             )
-            segment_cohort_xai[seg] = await call_llm(cohort_prompt)
+            segment_cohort_xai[seg] = await _call_llm_xai(cohort_prompt)
 
         # Attach cohort XAI to every customer row in that segment
         for r in results:
@@ -786,9 +786,9 @@ async def predict_single(
 
     results = run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df)
     r = results[0]
-    r["xai_churn_explanation"]   = await call_llm(build_churn_xai_prompt(r))
-    r["xai_segment_explanation"] = await call_llm(build_segment_xai_prompt(r))
-    r["xai_segment_cohort"]      = await call_llm(
+    r["xai_churn_explanation"]   = await _call_llm_xai(build_churn_xai_prompt(r))
+    r["xai_segment_explanation"] = await _call_llm_xai(build_segment_xai_prompt(r))
+    r["xai_segment_cohort"]      = await _call_llm_xai(
         build_segment_cohort_prompt(
             seg_label       = r["segment_label"],
             seg_prof        = r["segment_profile"],
@@ -1004,25 +1004,25 @@ Rules:
 """
 
 _SIM_NARRATIVE_SYSTEM = """\
-You are a senior customer success analyst writing a concise retention briefing. \
-Write 3-4 sentences in Indonesian (Bahasa Indonesia) that summarise:
-1. The customer's current churn risk situation
-2. The key drivers behind this trajectory
-3. The most important recommended action
+You are a senior customer success analyst writing a concise retention briefing.
+Write EXACTLY 3-4 sentences of flowing prose IN INDONESIAN (Bahasa Indonesia) covering:
+1. The customer's current churn risk level and score
+2. The top 1-2 drivers behind this trajectory (use SHAP factor names and numbers)
+3. The single most important recommended action with a specific timeline
 
-Be direct and specific. Reference actual numbers from the data. No bullet points — \
-flowing prose only. Max 120 words.
+Rules: No bullet points. No headers. No markdown. Reference actual numbers from the data.
+Output the prose directly — do not wrap it in any tags or preamble.
 """
 
 _SCENARIO_NARRATIVE_SYSTEM = """\
-You are a senior customer success analyst. A multi-agent team has debated an intervention \
-scenario for a customer. Write 3-4 sentences in Indonesian (Bahasa Indonesia) that summarise:
-1. What the scenario proposes and the projected churn reduction
-2. The strongest argument for and against (one sentence each)
+You are a senior customer success analyst summarising a multi-agent intervention debate.
+Write EXACTLY 3-4 sentences of flowing prose IN INDONESIAN (Bahasa Indonesia) covering:
+1. What the scenario proposes and the projected churn probability reduction (use the numbers)
+2. The strongest pro and con from the agent debate (one sentence)
 3. The recommended next action with a specific timeline
 
-Be direct and use the actual numbers from the debate. No bullet points — flowing prose only. \
-Max 130 words.
+Rules: No bullet points. No headers. No markdown.
+Output the prose directly — do not wrap it in any tags or preamble.
 """
 
 # ─── Scenario Multi-Agent Personas ────────────────────────────────────────────
@@ -1117,6 +1117,22 @@ def _extract_json(raw: str) -> dict:
     if start != -1 and end > start:
         return json.loads(cleaned[start:end])
     raise ValueError("no JSON object found")
+
+
+def _clean_narrative(raw: str) -> str:
+    """Strip think tags from narrative text.
+    If the entire output was inside a think block (common with reasoning models
+    that hit their token limit before closing </think>), fall back to stripping
+    just the tag markers and returning the content.
+    """
+    if not raw:
+        return raw
+    # Remove complete <think>...</think> blocks
+    cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+    if cleaned:
+        return cleaned
+    # Fallback: just strip the tag markers, keep the content
+    return re.sub(r"</?think>", "", raw, flags=re.IGNORECASE).strip()
 
 
 @app.post("/simulate")
@@ -1220,11 +1236,11 @@ async def simulate(request: SimulateRequest):
                 f"revenue_at_risk=${sim_data.get('revenue_at_risk', 0):,.0f}."
             )
             full_narrative = ""
-            async for token in stream_llm(_SIM_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=250):
+            async for token in stream_llm(_SIM_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=600):
                 full_narrative += token
                 yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
 
-            yield f"data: {json.dumps({'type': 'done', 'narrative': full_narrative})}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'narrative': _clean_narrative(full_narrative)})}\n\n"
             return
 
         # ══════════════════════════════════════════════════════════════════════
@@ -1303,11 +1319,11 @@ async def simulate(request: SimulateRequest):
             f"revenue_at_risk=${update_data.get('revenue_at_risk', 0):,.0f}."
         )
         full_narrative = ""
-        async for token in stream_llm(_SCENARIO_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=280):
+        async for token in stream_llm(_SCENARIO_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=600):
             full_narrative += token
             yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
 
-        yield f"data: {json.dumps({'type': 'done', 'narrative': full_narrative})}\n\n"
+        yield f"data: {json.dumps({'type': 'done', 'narrative': _clean_narrative(full_narrative)})}\n\n"
 
     return StreamingResponse(
         event_stream(),
