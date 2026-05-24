@@ -1042,15 +1042,25 @@ async def simulate(request: SimulateRequest):
 
         yield f"data: {json.dumps({'type': 'round_end', 'round': 2})}\n\n"
 
-        # ── Moderator: silent synthesis via call_llm (no streaming in feed) ───
+        # ── Moderator: silent token collection via stream_llm ────────────────
         yield f"data: {json.dumps({'type': 'moderator_thinking'})}\n\n"
 
-        mod          = AGENT_PERSONAS["Moderator"]
-        full_debate  = "\n\nSELURUH DEBAT:\n" + "\n\n".join(
+        mod         = AGENT_PERSONAS["Moderator"]
+        full_debate = "\n\nSELURUH DEBAT:\n" + "\n\n".join(
             f"[{m['agent']} - Ronde {m['round']}]: {m['content']}" for m in all_msgs
         )
-        mod_input    = f"{mod['system']}\n\n{ctx}{full_debate}\n\nSintesis semua argumen dan berikan keputusan final dalam JSON."
-        full_mod     = await call_llm(mod_input)
+        user_msg_mod = (
+            f"{ctx}{full_debate}"
+            f"\n\nSintesis semua argumen di atas dan berikan keputusan final dalam format JSON."
+        )
+
+        # Collect tokens silently — no SSE emission until conclusion is ready
+        full_mod = ""
+        try:
+            async for token in stream_llm(mod["system"], user_msg_mod):
+                full_mod += token
+        except Exception as exc:
+            full_mod = ""
 
         conclusion: dict = {}
         try:
@@ -1059,7 +1069,7 @@ async def simulate(request: SimulateRequest):
             conclusion = json.loads(cleaned)
         except Exception:
             conclusion = {
-                "kesimpulan":                full_mod,
+                "kesimpulan":                full_mod or "Moderator tidak dapat mensintesis kesimpulan.",
                 "churn_score_before":        request.customer_data.churn_score,
                 "churn_score_after":         request.customer_data.churn_score,
                 "confidence":                0,
