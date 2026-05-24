@@ -861,9 +861,11 @@ class _CustomerDataSim(BaseModel):
 
 
 class SimulateRequest(BaseModel):
-    customer_data: _CustomerDataSim
-    scenario:      str        = ""   # optional: intervention scenario for projection
-    chat_history:  list[dict] = []   # [{question, narrative}] — prior turns
+    customer_data:  _CustomerDataSim
+    scenario:       str        = ""   # optional: intervention scenario for projection
+    chat_history:   list[dict] = []   # [{question, narrative}] — prior turns
+    horizon_weeks:  int        = 12   # forecast horizon in weeks (4/8/12/24/52)
+    segment_labels: list[str]  = []   # actual ML segment names from DB (for migration labels)
 
 
 def _build_ctx(c: _CustomerDataSim, scenario: str) -> str:
@@ -924,43 +926,81 @@ async def call_llm(system: str, user_msg: str, max_tokens: int = 1200) -> str:
         return data["choices"][0]["message"]["content"]
 
 
-_SIM_JSON_SYSTEM = """\
+def _build_sim_json_system(horizon_weeks: int = 12, segment_labels: list = None) -> str:
+    """Build dynamic simulation JSON system prompt for given forecast horizon."""
+    # Determine time step — keep ~7-14 points regardless of horizon
+    if horizon_weeks <= 8:
+        step = 1
+    elif horizon_weeks <= 16:
+        step = 2
+    else:
+        step = 4  # monthly steps (4 weeks per month)
+
+    time_points = list(range(0, horizon_weeks + 1, step))
+    if time_points[-1] != horizon_weeks:
+        time_points.append(horizon_weeks)
+
+    # Build the baseline array schema
+    baseline_items = ",\n    ".join(
+        f'{{"week": {w}, "prob": <float 0-100>}}' for w in time_points
+    )
+    # First point must pin to actual churn_score
+    baseline_items = baseline_items.replace(
+        '{"week": 0, "prob": <float 0-100>}',
+        '{"week": 0, "prob": <ACTUAL_CHURN_SCORE_0_TO_100>}',
+        1,
+    )
+
+    # Build segment migration labels
+    if segment_labels and len(segment_labels) >= 2:
+        seg_items = ",\n    ".join(
+            f'{{"label": "{label}", "prob": <float 0.0-1.0>}}' for label in segment_labels
+        )
+        seg_note = f"Use these exact segment labels from the system: {segment_labels}"
+    else:
+        seg_items = (
+            '{"label": "Churned", "prob": <float 0.0-1.0>},\n'
+            '    {"label": "High Risk", "prob": <float 0.0-1.0>},\n'
+            '    {"label": "At Risk", "prob": <float 0.0-1.0>},\n'
+            '    {"label": "Retained", "prob": <float 0.0-1.0>}'
+        )
+        seg_note = "Use these standard risk migration labels"
+
+    mid_week   = time_points[len(time_points) // 2]
+    never_val  = horizon_weeks + 1
+
+    return f"""\
 You are a customer retention analytics engine. Given a customer's churn data, \
-produce a precise JSON churn trajectory forecast. No prose — output ONLY valid JSON.
+produce a precise JSON churn trajectory forecast for a {horizon_weeks}-week horizon. \
+No prose — output ONLY valid JSON.
 
 The JSON schema (all fields required):
-{
+{{
   "baseline": [
-    {"week": 0, "prob": <ACTUAL_CHURN_SCORE_0_TO_100>},
-    {"week": 2, "prob": <float 0-100>},
-    {"week": 4, "prob": <float 0-100>},
-    {"week": 6, "prob": <float 0-100>},
-    {"week": 8, "prob": <float 0-100>},
-    {"week": 10, "prob": <float 0-100>},
-    {"week": 12, "prob": <float 0-100>}
+    {baseline_items}
   ],
   "projection": null,
-  "retention_window_weeks": <int: estimated weeks before churn probability exceeds 80>,
+  "retention_window_weeks": <int: weeks before churn probability exceeds 80>,
   "revenue_at_risk": <float: monthly_revenue * (churn_prob/100) * 3>,
   "confidence": <float 0.0-1.0>,
   "intervention_impact_pct": null,
   "segment_migration": [
-    {"label": "Churned", "prob": <float 0.0-1.0>},
-    {"label": "High Risk", "prob": <float 0.0-1.0>},
-    {"label": "At Risk", "prob": <float 0.0-1.0>},
-    {"label": "Retained", "prob": <float 0.0-1.0>}
+    {seg_items}
   ]
-}
+}}
 
 Rules:
 - baseline[0].prob MUST equal the actual churn_score from the customer data exactly.
-- If a scenario is provided, also fill "projection" with the same 7-point structure \
+- The forecast spans {horizon_weeks} weeks ({horizon_weeks // 4} months). \
+  Generate realistic churn evolution over this full period based on the customer's risk factors.
+- If a scenario is provided, also fill "projection" with the same time-point structure \
   (week 0 same as baseline[0]), and fill "intervention_impact_pct" with the estimated \
   churn reduction percentage (positive number).
-- segment_migration probs must sum to 1.0.
-- retention_window_weeks: how many weeks until baseline churn probability crosses 80. \
-  If already above 80, set to 0. If it never crosses 80 in 12 weeks, set to 13.
-- revenue_at_risk: monthly revenue × (week-6 churn_prob / 100) × 3.
+- segment_migration probs must sum to 1.0. {seg_note}.
+- retention_window_weeks: weeks until baseline churn probability crosses 80. \
+  If already above 80 at week 0, set to 0. \
+  If it never crosses 80 within {horizon_weeks} weeks, set to {never_val}.
+- revenue_at_risk: monthly_revenue × (churn_prob at week {mid_week} / 100) × 3.
 """
 
 _SIM_NARRATIVE_SYSTEM = """\
@@ -995,6 +1035,21 @@ async def simulate(request: SimulateRequest):
         ]
         history_block = "\n\nPREVIOUS CONVERSATION TURNS:\n" + "\n\n".join(lines)
 
+    horizon   = request.horizon_weeks
+    seg_lbls  = request.segment_labels or []
+    sim_system = _build_sim_json_system(horizon, seg_lbls)
+
+    # Determine fallback time points matching the dynamic horizon
+    if horizon <= 8:
+        _step = 1
+    elif horizon <= 16:
+        _step = 2
+    else:
+        _step = 4
+    _fallback_points = list(range(0, horizon + 1, _step))
+    if _fallback_points[-1] != horizon:
+        _fallback_points.append(horizon)
+
     async def event_stream():
         # ── Step 1: Structured JSON data ─────────────────────────────────────
         yield f"data: {json.dumps({'type': 'thinking'})}\n\n"
@@ -1002,7 +1057,7 @@ async def simulate(request: SimulateRequest):
         sim_data: dict = {}
         try:
             raw = await call_llm(
-                _SIM_JSON_SYSTEM,
+                sim_system,
                 f"{ctx}{history_block}\n\nGenerate the churn trajectory JSON now.",
                 max_tokens=900,
             )
@@ -1021,34 +1076,40 @@ async def simulate(request: SimulateRequest):
                 sim_data["baseline"][0]["prob"] = round(c.churn_score, 2)
 
         except Exception as exc:
-            # Fallback: synthetic trajectory based on churn_score
+            # Fallback: synthetic trajectory matching the requested horizon
             base_score = c.churn_score
-            decay = 1.05 if base_score > 60 else 1.02
+            decay      = 1.05 if base_score > 60 else 1.02
+            baseline   = [
+                {"week": w, "prob": round(min(100, base_score * decay ** i), 2)}
+                for i, w in enumerate(_fallback_points)
+            ]
+            mid_idx    = len(_fallback_points) // 2
+            mid_prob   = min(100, base_score * decay ** mid_idx)
+            monthly_rev = c.segment_rfm_context.get("total_revenue", {}).get("customer", 0)
+
+            # Build fallback segment migration using real labels if provided
+            if seg_lbls and len(seg_lbls) >= 2:
+                n     = len(seg_lbls)
+                probs = [round(base_score / 100 * (0.7 / max(n - 1, 1)) * i + (1 - base_score / 100) * (0.3 / max(n - 1, 1)) * (n - 1 - i), 3) for i in range(n)]
+                total = sum(probs) or 1
+                seg_migration = [{"label": seg_lbls[i], "prob": round(probs[i] / total, 3)} for i in range(n)]
+            else:
+                seg_migration = [
+                    {"label": "Churned",   "prob": round(base_score / 100 * 0.7,       3)},
+                    {"label": "High Risk", "prob": round(base_score / 100 * 0.2,       3)},
+                    {"label": "At Risk",   "prob": round((1 - base_score / 100) * 0.4, 3)},
+                    {"label": "Retained",  "prob": round((1 - base_score / 100) * 0.6, 3)},
+                ]
+
             sim_data = {
-                "baseline": [
-                    {"week": 0,  "prob": round(base_score, 2)},
-                    {"week": 2,  "prob": round(min(100, base_score * decay),       2)},
-                    {"week": 4,  "prob": round(min(100, base_score * decay**2),    2)},
-                    {"week": 6,  "prob": round(min(100, base_score * decay**3),    2)},
-                    {"week": 8,  "prob": round(min(100, base_score * decay**4),    2)},
-                    {"week": 10, "prob": round(min(100, base_score * decay**5),    2)},
-                    {"week": 12, "prob": round(min(100, base_score * decay**6),    2)},
-                ],
-                "projection": None,
+                "baseline":               baseline,
+                "projection":             None,
                 "retention_window_weeks": max(0, int((80 - base_score) / (base_score * (decay - 1) + 0.5))),
-                "revenue_at_risk": round(
-                    c.segment_rfm_context.get("total_revenue", {}).get("customer", 0)
-                    * (min(100, base_score * decay**3) / 100) * 3, 2
-                ),
-                "confidence": 0.6,
+                "revenue_at_risk":        round(monthly_rev * (mid_prob / 100) * 3, 2),
+                "confidence":             0.6,
                 "intervention_impact_pct": None,
-                "segment_migration": [
-                    {"label": "Churned",   "prob": round(base_score / 100 * 0.7,        3)},
-                    {"label": "High Risk", "prob": round(base_score / 100 * 0.2,        3)},
-                    {"label": "At Risk",   "prob": round((1 - base_score / 100) * 0.4,  3)},
-                    {"label": "Retained",  "prob": round((1 - base_score / 100) * 0.6,  3)},
-                ],
-                "_error": str(exc)[:120],
+                "segment_migration":      seg_migration,
+                "_error":                 str(exc)[:120],
             }
 
         yield f"data: {json.dumps({'type': 'data', 'payload': sim_data})}\n\n"
@@ -1058,10 +1119,11 @@ async def simulate(request: SimulateRequest):
             f"\n\nScenario being evaluated: {request.scenario}"
             if request.scenario.strip() else ""
         )
+        last_week  = sim_data.get('baseline', [{}])[-1]
         narrative_prompt = (
             f"{ctx}{scenario_note}{history_block}"
-            f"\n\nChurn trajectory summary: week-0={c.churn_score:.1f}, "
-            f"week-12={sim_data.get('baseline', [{}])[-1].get('prob', c.churn_score):.1f}, "
+            f"\n\nChurn trajectory summary ({horizon}-week horizon): week-0={c.churn_score:.1f}, "
+            f"week-{last_week.get('week', horizon)}={last_week.get('prob', c.churn_score):.1f}, "
             f"retention_window={sim_data.get('retention_window_weeks', '?')} weeks, "
             f"revenue_at_risk=${sim_data.get('revenue_at_risk', 0):,.0f}."
         )
