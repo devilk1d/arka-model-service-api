@@ -1366,7 +1366,7 @@ async def simulate(request: SimulateRequest):
                 delta = rng.uniform(-0.5, 1.5)
                 cur = max(5, min(80, cur + delta))
             baseline.append({"week": w, "prob": round(cur, 2)})
-        mid_prob    = min(100, base_score * decay ** (len(_fallback_points) // 2))
+        mid_prob    = baseline[len(baseline) // 2]['prob'] if len(baseline) > 1 else base_score
         monthly_rev = c.segment_rfm_context.get("total_revenue", {}).get("customer", 0)
         if seg_lbls and len(seg_lbls) >= 2:
             n     = len(seg_lbls)
@@ -1387,7 +1387,7 @@ async def simulate(request: SimulateRequest):
         result = {
             "baseline":                baseline,
             "projection":              None,
-            "retention_window_weeks":  max(0, int((80 - base_score) / (base_score * (decay - 1) + 0.5))),
+            "retention_window_weeks":  next((pt['week'] for pt in baseline if pt['prob'] >= 80), 0),
             "revenue_at_risk":         round(monthly_rev * (mid_prob / 100) * 3, 2),
             "confidence":              0.6,
             "intervention_impact_pct": None,
