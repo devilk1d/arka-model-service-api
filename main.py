@@ -1014,122 +1014,296 @@ Be direct and specific. Reference actual numbers from the data. No bullet points
 flowing prose only. Max 120 words.
 """
 
+_SCENARIO_NARRATIVE_SYSTEM = """\
+You are a senior customer success analyst. A multi-agent team has debated an intervention \
+scenario for a customer. Write 3-4 sentences in Indonesian (Bahasa Indonesia) that summarise:
+1. What the scenario proposes and the projected churn reduction
+2. The strongest argument for and against (one sentence each)
+3. The recommended next action with a specific timeline
+
+Be direct and use the actual numbers from the debate. No bullet points — flowing prose only. \
+Max 130 words.
+"""
+
+# ─── Scenario Multi-Agent Personas ────────────────────────────────────────────
+
+SCENARIO_AGENTS = [
+    {
+        "name":  "Risk Analyst",
+        "short": "RA",
+        "color": "#ef4444",
+        "system": (
+            "You are a churn risk analyst. Given a customer's data and a proposed intervention "
+            "scenario, deliver a 2-3 sentence risk assessment. State concretely: by what percentage "
+            "will this intervention reduce churn probability, and what is the residual risk if it "
+            "underperforms? Give a specific numeric estimate. No markdown, no headers."
+        ),
+    },
+    {
+        "name":  "Customer Success",
+        "short": "CS",
+        "color": "#3b82f6",
+        "system": (
+            "You are a customer success manager. Given a customer's data and a proposed intervention, "
+            "give a 2-3 sentence assessment. Does this intervention address the root cause of churn "
+            "for this specific customer? Will it actually change their behaviour? What one thing must "
+            "accompany it to succeed? Be realistic and direct. No markdown, no headers."
+        ),
+    },
+    {
+        "name":  "Finance Analyst",
+        "short": "FN",
+        "color": "#f59e0b",
+        "system": (
+            "You are a finance analyst. Given a customer's data and a proposed intervention, "
+            "calculate the ROI in 2-3 sentences. What is the estimated cost of the intervention "
+            "vs. the monthly revenue at risk? Is this financially justified given the churn probability? "
+            "Provide specific dollar amounts. No markdown, no headers."
+        ),
+    },
+    {
+        "name":  "Product Manager",
+        "short": "PM",
+        "color": "#8b5cf6",
+        "system": (
+            "You are a product manager. Given a customer's data and a proposed intervention, "
+            "predict in 2-3 sentences how it will affect product engagement and feature adoption. "
+            "Will the customer increase usage or remain disengaged? What product change or feature "
+            "would amplify the intervention's effect? Be specific. No markdown, no headers."
+        ),
+    },
+]
+
+# Scenario JSON: produces ONLY the projection + updated metric fields (not baseline)
+_SCENARIO_UPDATE_JSON_SYSTEM = """\
+You are a customer retention analytics engine. A multi-agent team has debated an intervention \
+scenario. Based on their analysis, produce a JSON update with ONLY these fields. \
+No prose — output ONLY valid JSON.
+
+Schema:
+{
+  "projection": [
+    {"week": 0, "prob": <MUST EQUAL current churn_score exactly>},
+    {"week": W, "prob": <float 0-100>},
+    ...
+  ],
+  "intervention_impact_pct": <float: percentage-point reduction at final week vs baseline_final>,
+  "confidence": <float 0.0-1.0>,
+  "retention_window_weeks": <int: weeks until projection prob exceeds 80; use horizon+1 if never>,
+  "revenue_at_risk": <float: monthly_revenue × (projection_midpoint_prob/100) × 3>,
+  "segment_migration": [
+    {"label": "...", "prob": <float 0.0-1.0>},
+    ...
+  ]
+}
+
+Critical rules:
+- projection[0].prob MUST equal the customer's current churn_score exactly (provided below).
+- projection values must generally be LOWER than the baseline (intervention reduces churn).
+- intervention_impact_pct = baseline_final_prob − projection_final_prob (must be positive).
+- segment_migration probs must sum to 1.0; use the same labels as provided.
+- Match the same weekly time-points as the baseline array provided below.
+- Output ONLY the JSON object. No explanation, no markdown fences.
+"""
+
+
+def _extract_json(raw: str) -> dict:
+    """Strip think-tags / fences and extract the first JSON object."""
+    cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"```\s*$",          "", cleaned, flags=re.MULTILINE).strip()
+    start = cleaned.find("{")
+    end   = cleaned.rfind("}") + 1
+    if start != -1 and end > start:
+        return json.loads(cleaned[start:end])
+    raise ValueError("no JSON object found")
+
 
 @app.post("/simulate")
 async def simulate(request: SimulateRequest):
     """
     Churn trajectory simulation SSE.
-    Step 1: call_llm → emit 'data' event with chart/metrics JSON.
-    Step 2: stream_llm → emit 'token' events for narrative.
-    Step 3: emit 'done'.
-    """
-    c   = request.customer_data
-    ctx = _build_ctx(c, request.scenario)
 
-    # Append prior chat turns for follow-up scenarios
+    • No scenario  → single call_llm (JSON) + stream_llm (narrative)  [fast]
+    • With scenario → 4-agent debate (stream) → call_llm (projection JSON) → stream_llm (narrative)
+    """
+    c       = request.customer_data
+    ctx     = _build_ctx(c, "")          # scenario injected separately for agents
+    horizon = request.horizon_weeks
+    seg_lbls = request.segment_labels or []
+
     history_block = ""
     if request.chat_history:
         lines = [
-            f"Q: {turn.get('question', '')}\nA (summary): {str(turn.get('narrative', ''))[:300]}"
-            for turn in request.chat_history[-4:]
+            f"Q: {t.get('question', '')}\nA: {str(t.get('narrative', ''))[:250]}"
+            for t in request.chat_history[-4:]
         ]
-        history_block = "\n\nPREVIOUS CONVERSATION TURNS:\n" + "\n\n".join(lines)
+        history_block = "\n\nPREVIOUS TURNS:\n" + "\n\n".join(lines)
 
-    horizon   = request.horizon_weeks
-    seg_lbls  = request.segment_labels or []
-    sim_system = _build_sim_json_system(horizon, seg_lbls)
-
-    # Determine fallback time points matching the dynamic horizon
-    if horizon <= 8:
-        _step = 1
-    elif horizon <= 16:
-        _step = 2
-    else:
-        _step = 4
+    # ── shared helpers ────────────────────────────────────────────────────────
+    if horizon <= 8:   _step = 1
+    elif horizon <= 16: _step = 2
+    else:               _step = 4
     _fallback_points = list(range(0, horizon + 1, _step))
     if _fallback_points[-1] != horizon:
         _fallback_points.append(horizon)
 
+    def _fallback_sim(exc_msg: str = "") -> dict:
+        base_score  = c.churn_score
+        decay       = 1.05 if base_score > 60 else 1.02
+        baseline    = [
+            {"week": w, "prob": round(min(100, base_score * decay ** i), 2)}
+            for i, w in enumerate(_fallback_points)
+        ]
+        mid_prob    = min(100, base_score * decay ** (len(_fallback_points) // 2))
+        monthly_rev = c.segment_rfm_context.get("total_revenue", {}).get("customer", 0)
+        if seg_lbls and len(seg_lbls) >= 2:
+            n     = len(seg_lbls)
+            probs = [
+                round(base_score / 100 * (0.7 / max(n - 1, 1)) * i
+                      + (1 - base_score / 100) * (0.3 / max(n - 1, 1)) * (n - 1 - i), 3)
+                for i in range(n)
+            ]
+            tot = sum(probs) or 1
+            seg_mig = [{"label": seg_lbls[i], "prob": round(probs[i] / tot, 3)} for i in range(n)]
+        else:
+            seg_mig = [
+                {"label": "Churned",   "prob": round(base_score / 100 * 0.7,       3)},
+                {"label": "High Risk", "prob": round(base_score / 100 * 0.2,       3)},
+                {"label": "At Risk",   "prob": round((1 - base_score / 100) * 0.4, 3)},
+                {"label": "Retained",  "prob": round((1 - base_score / 100) * 0.6, 3)},
+            ]
+        result = {
+            "baseline":               baseline,
+            "projection":             None,
+            "retention_window_weeks": max(0, int((80 - base_score) / (base_score * (decay - 1) + 0.5))),
+            "revenue_at_risk":        round(monthly_rev * (mid_prob / 100) * 3, 2),
+            "confidence":             0.6,
+            "intervention_impact_pct": None,
+            "segment_migration":      seg_mig,
+        }
+        if exc_msg:
+            result["_error"] = exc_msg[:120]
+        return result
+
+    # ─────────────────────────────────────────────────────────────────────────
     async def event_stream():
-        # ── Step 1: Structured JSON data ─────────────────────────────────────
+
+        # ══════════════════════════════════════════════════════════════════════
+        # PATH A — Initial run (no scenario)
+        # ══════════════════════════════════════════════════════════════════════
+        if not request.scenario.strip():
+            yield f"data: {json.dumps({'type': 'thinking'})}\n\n"
+
+            sim_data: dict = {}
+            try:
+                sim_system = _build_sim_json_system(horizon, seg_lbls)
+                raw = await call_llm(
+                    sim_system,
+                    f"{ctx}{history_block}\n\nGenerate the churn trajectory JSON now.",
+                    max_tokens=900,
+                )
+                sim_data = _extract_json(raw)
+                if sim_data.get("baseline"):
+                    sim_data["baseline"][0]["prob"] = round(c.churn_score, 2)
+            except Exception as exc:
+                sim_data = _fallback_sim(str(exc))
+
+            yield f"data: {json.dumps({'type': 'data', 'payload': sim_data})}\n\n"
+
+            last_week = sim_data.get("baseline", [{}])[-1]
+            narrative_prompt = (
+                f"{ctx}{history_block}"
+                f"\n\nChurn trajectory ({horizon}w): week-0={c.churn_score:.1f}, "
+                f"week-{last_week.get('week', horizon)}={last_week.get('prob', c.churn_score):.1f}, "
+                f"retention_window={sim_data.get('retention_window_weeks', '?')}w, "
+                f"revenue_at_risk=${sim_data.get('revenue_at_risk', 0):,.0f}."
+            )
+            full_narrative = ""
+            async for token in stream_llm(_SIM_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=250):
+                full_narrative += token
+                yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+
+            yield f"data: {json.dumps({'type': 'done', 'narrative': full_narrative})}\n\n"
+            return
+
+        # ══════════════════════════════════════════════════════════════════════
+        # PATH B — Scenario run (multi-agent debate)
+        # ══════════════════════════════════════════════════════════════════════
+        scenario_block = f"\n\nINTERVENTION SCENARIO: {request.scenario}"
+        agent_outputs: list[dict] = []   # [{name, content}]
+
+        # ── Round 1: each agent analyses the scenario ─────────────────────────
+        for agent in SCENARIO_AGENTS:
+            yield f"data: {json.dumps({'type': 'agent_start', 'agent': agent['name'], 'short': agent['short'], 'color': agent['color']})}\n\n"
+            user_msg = f"{ctx}{scenario_block}{history_block}\n\nProvide your analysis."
+            full_content = ""
+            async for token in stream_llm(agent["system"], user_msg, max_tokens=200):
+                full_content += token
+                yield f"data: {json.dumps({'type': 'agent_token', 'agent': agent['name'], 'content': token})}\n\n"
+            agent_outputs.append({"name": agent["name"], "content": full_content})
+            yield f"data: {json.dumps({'type': 'agent_done', 'agent': agent['name']})}\n\n"
+
+        # ── Synthesise debate → projection JSON ──────────────────────────────
         yield f"data: {json.dumps({'type': 'thinking'})}\n\n"
 
-        sim_data: dict = {}
+        debate_text = "\n\n".join(
+            f"[{o['name']}]: {o['content']}" for o in agent_outputs
+        )
+        # Build baseline reference so model knows exact time-points + starting prob
+        baseline_ref = ", ".join(
+            f"week {p}: {c.churn_score:.1f}" if p == 0 else f"week {p}: ?"
+            for p in _fallback_points
+        )
+        monthly_rev = c.segment_rfm_context.get("total_revenue", {}).get("customer", 0)
+        seg_note = f"Segment labels to use: {seg_lbls}" if seg_lbls else "Use standard labels: Churned, High Risk, At Risk, Retained"
+
+        synth_user = (
+            f"{ctx}{scenario_block}"
+            f"\n\nBASELINE TIME POINTS (weeks): {_fallback_points}"
+            f"\nMONTHLY REVENUE: ${monthly_rev:,.0f}"
+            f"\n{seg_note}"
+            f"\n\nMULTI-AGENT DEBATE:\n{debate_text}"
+            f"\n\nGenerate the scenario update JSON now."
+        )
+
+        update_data: dict = {}
         try:
-            raw = await call_llm(
-                sim_system,
-                f"{ctx}{history_block}\n\nGenerate the churn trajectory JSON now.",
-                max_tokens=900,
-            )
-            cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.MULTILINE)
-            cleaned = re.sub(r"```\s*$", "", cleaned, flags=re.MULTILINE).strip()
-            start = cleaned.find("{")
-            end   = cleaned.rfind("}") + 1
-            if start != -1 and end > start:
-                sim_data = json.loads(cleaned[start:end])
-            else:
-                raise ValueError("no JSON object found in LLM response")
-
-            # Ensure week-0 is pinned to actual churn_score
-            if sim_data.get("baseline") and len(sim_data["baseline"]) > 0:
-                sim_data["baseline"][0]["prob"] = round(c.churn_score, 2)
-
+            raw = await call_llm(_SCENARIO_UPDATE_JSON_SYSTEM, synth_user, max_tokens=700)
+            update_data = _extract_json(raw)
+            # Pin week-0
+            if update_data.get("projection") and len(update_data["projection"]) > 0:
+                update_data["projection"][0]["prob"] = round(c.churn_score, 2)
         except Exception as exc:
-            # Fallback: synthetic trajectory matching the requested horizon
-            base_score = c.churn_score
-            decay      = 1.05 if base_score > 60 else 1.02
-            baseline   = [
-                {"week": w, "prob": round(min(100, base_score * decay ** i), 2)}
-                for i, w in enumerate(_fallback_points)
-            ]
-            mid_idx    = len(_fallback_points) // 2
-            mid_prob   = min(100, base_score * decay ** mid_idx)
-            monthly_rev = c.segment_rfm_context.get("total_revenue", {}).get("customer", 0)
-
-            # Build fallback segment migration using real labels if provided
-            if seg_lbls and len(seg_lbls) >= 2:
-                n     = len(seg_lbls)
-                probs = [round(base_score / 100 * (0.7 / max(n - 1, 1)) * i + (1 - base_score / 100) * (0.3 / max(n - 1, 1)) * (n - 1 - i), 3) for i in range(n)]
-                total = sum(probs) or 1
-                seg_migration = [{"label": seg_lbls[i], "prob": round(probs[i] / total, 3)} for i in range(n)]
-            else:
-                seg_migration = [
-                    {"label": "Churned",   "prob": round(base_score / 100 * 0.7,       3)},
-                    {"label": "High Risk", "prob": round(base_score / 100 * 0.2,       3)},
-                    {"label": "At Risk",   "prob": round((1 - base_score / 100) * 0.4, 3)},
-                    {"label": "Retained",  "prob": round((1 - base_score / 100) * 0.6, 3)},
-                ]
-
-            sim_data = {
-                "baseline":               baseline,
-                "projection":             None,
-                "retention_window_weeks": max(0, int((80 - base_score) / (base_score * (decay - 1) + 0.5))),
-                "revenue_at_risk":        round(monthly_rev * (mid_prob / 100) * 3, 2),
-                "confidence":             0.6,
-                "intervention_impact_pct": None,
-                "segment_migration":      seg_migration,
-                "_error":                 str(exc)[:120],
+            # Fallback projection: 30% reduction from baseline
+            update_data = {
+                "projection": [
+                    {"week": w, "prob": round(min(100, c.churn_score * (0.70 ** (1 + i * 0.15))), 2)}
+                    for i, w in enumerate(_fallback_points)
+                ],
+                "intervention_impact_pct": 30.0,
+                "confidence":              0.55,
+                "retention_window_weeks":  min(horizon + 1, 8),
+                "revenue_at_risk":         round(monthly_rev * (c.churn_score * 0.65 / 100) * 3, 2),
+                "_error": str(exc)[:120],
             }
+            if update_data["projection"]:
+                update_data["projection"][0]["prob"] = round(c.churn_score, 2)
 
-        yield f"data: {json.dumps({'type': 'data', 'payload': sim_data})}\n\n"
+        yield f"data: {json.dumps({'type': 'data', 'payload': update_data})}\n\n"
 
-        # ── Step 2: Streaming narrative ───────────────────────────────────────
-        scenario_note = (
-            f"\n\nScenario being evaluated: {request.scenario}"
-            if request.scenario.strip() else ""
-        )
-        last_week  = sim_data.get('baseline', [{}])[-1]
+        # ── Narrative: summarise debate + outcome ─────────────────────────────
+        proj_last = (update_data.get("projection") or [{}])[-1]
         narrative_prompt = (
-            f"{ctx}{scenario_note}{history_block}"
-            f"\n\nChurn trajectory summary ({horizon}-week horizon): week-0={c.churn_score:.1f}, "
-            f"week-{last_week.get('week', horizon)}={last_week.get('prob', c.churn_score):.1f}, "
-            f"retention_window={sim_data.get('retention_window_weeks', '?')} weeks, "
-            f"revenue_at_risk=${sim_data.get('revenue_at_risk', 0):,.0f}."
+            f"{ctx}{scenario_block}"
+            f"\n\nDEBATE SUMMARY:\n{debate_text[:600]}"
+            f"\n\nProjected outcome: churn at week-{proj_last.get('week', horizon)}="
+            f"{proj_last.get('prob', c.churn_score):.1f}%, "
+            f"intervention_impact={update_data.get('intervention_impact_pct', 0):.0f}pp reduction, "
+            f"revenue_at_risk=${update_data.get('revenue_at_risk', 0):,.0f}."
         )
-
         full_narrative = ""
-        async for token in stream_llm(_SIM_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=250):
+        async for token in stream_llm(_SCENARIO_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=280):
             full_narrative += token
             yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
 
