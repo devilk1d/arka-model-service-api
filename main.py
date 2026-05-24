@@ -847,7 +847,11 @@ async def stream_llm(system: str, user_msg: str, max_tokens: int = 600):
 
 
 async def stream_llm_no_think(system: str, user_msg: str, max_tokens: int = 600):
-    """Stream tokens from LLM, filtering out <think>...</think> blocks in real-time."""
+    """Stream tokens from LLM, filtering <think>...</think> blocks in real-time.
+
+    Fix: when buf is too short to safely emit (could be start of a <think> tag),
+    hold it in the buffer without emitting — do NOT emit-and-keep (causes repetition).
+    """
     OPEN = "<think>"
     CLOSE = "</think>"
     buf = ""
@@ -855,33 +859,42 @@ async def stream_llm_no_think(system: str, user_msg: str, max_tokens: int = 600)
 
     async for tok in stream_llm(system, user_msg, max_tokens):
         buf += tok
-        out = ""
 
-        while buf:
+        while True:
             if in_think:
                 pos = buf.find(CLOSE)
                 if pos >= 0:
                     buf = buf[pos + len(CLOSE):]
                     in_think = False
+                    # continue loop — there may be normal content after </think>
                 else:
+                    # Still inside <think>; discard everything except a trailing
+                    # window that could be a split closing tag.
                     keep = len(CLOSE) - 1
-                    buf = buf[-keep:] if len(buf) >= keep else buf
+                    buf = buf[-keep:] if len(buf) > keep else buf
                     break
             else:
                 pos = buf.find(OPEN)
                 if pos >= 0:
-                    out += buf[:pos]
+                    out = buf[:pos]
                     buf = buf[pos + len(OPEN):]
                     in_think = True
+                    if out:
+                        yield out
+                    # continue loop — process remainder after <think>
                 else:
+                    # No <think> found; emit all but a trailing window that could
+                    # be a partial opening tag starting at the end of buf.
                     keep = len(OPEN) - 1
-                    out += buf[:-keep] if len(buf) >= keep else buf
-                    buf = buf[-keep:] if len(buf) >= keep else buf
+                    if len(buf) > keep:
+                        out = buf[:-keep]
+                        buf = buf[-keep:]
+                        if out:
+                            yield out
+                    # else: buf is too short — hold everything, wait for more tokens
                     break
 
-        if out:
-            yield out
-
+    # Flush whatever remains outside a think block
     if buf and not in_think:
         yield buf
 
@@ -1065,139 +1078,127 @@ Rules: No bullet points. No headers. No markdown.
 Output the prose directly — do not wrap it in any tags or preamble.
 """
 
-# ─── Scenario Multi-Agent Personas ────────────────────────────────────────────
+# ─── Unified Agent Config ─────────────────────────────────────────────────────
+# One list of persona metadata. System prompts are selected per-mode below.
 
-SCENARIO_AGENTS = [
-    {
-        "name":  "Risk Analyst",
-        "short": "RA",
-        "color": "#ef4444",
-        "system": (
-            "You are a churn risk analyst. Given a customer's data and a proposed intervention "
-            "scenario, deliver a 2-3 sentence risk assessment. State concretely: by what percentage "
-            "will this intervention reduce churn probability, and what is the residual risk if it "
-            "underperforms? Give a specific numeric estimate. No markdown, no headers."
-        ),
-    },
-    {
-        "name":  "Customer Success",
-        "short": "CS",
-        "color": "#3b82f6",
-        "system": (
-            "You are a customer success manager. Given a customer's data and a proposed intervention, "
-            "give a 2-3 sentence assessment. Does this intervention address the root cause of churn "
-            "for this specific customer? Will it actually change their behaviour? What one thing must "
-            "accompany it to succeed? Be realistic and direct. No markdown, no headers."
-        ),
-    },
-    {
-        "name":  "Finance Analyst",
-        "short": "FN",
-        "color": "#f59e0b",
-        "system": (
-            "You are a finance analyst. Given a customer's data and a proposed intervention, "
-            "calculate the ROI in 2-3 sentences. What is the estimated cost of the intervention "
-            "vs. the monthly revenue at risk? Is this financially justified given the churn probability? "
-            "Provide specific dollar amounts. No markdown, no headers."
-        ),
-    },
-    {
-        "name":  "Product Manager",
-        "short": "PM",
-        "color": "#8b5cf6",
-        "system": (
-            "You are a product manager. Given a customer's data and a proposed intervention, "
-            "predict in 2-3 sentences how it will affect product engagement and feature adoption. "
-            "Will the customer increase usage or remain disengaged? What product change or feature "
-            "would amplify the intervention's effect? Be specific. No markdown, no headers."
-        ),
-    },
+AGENT_PERSONAS = [
+    {"name": "Risk Analyst",    "short": "RA", "color": "#ef4444"},
+    {"name": "Customer Success","short": "CS", "color": "#3b82f6"},
+    {"name": "Finance Analyst", "short": "FN", "color": "#f59e0b"},
+    {"name": "Product Manager", "short": "PM", "color": "#8b5cf6"},
 ]
 
-# Baseline agents — run on initial simulation to analyze situation & recommend actions
-BASELINE_AGENTS = [
-    {
-        "name":  "Risk Analyst",
-        "short": "RA",
-        "color": "#ef4444",
-        "system": (
-            "You are a churn risk analyst. Review this customer's churn trajectory and top risk factors. "
-            "Write 2-3 sentences identifying the most critical risk driver and its severity. "
-            "End with one concrete, specific intervention that would most reduce churn risk. "
-            "No markdown, no bullet points. Be direct and use actual numbers from the data."
-        ),
-    },
-    {
-        "name":  "Customer Success",
-        "short": "CS",
-        "color": "#3b82f6",
-        "system": (
-            "You are a customer success manager. Analyze this customer's engagement and sentiment signals. "
-            "Write 2-3 sentences about the root cause of their disengagement and what behaviour change is needed. "
-            "End with one specific outreach or engagement action you would take this week. "
-            "No markdown, no bullet points. Reference actual metrics."
-        ),
-    },
-    {
-        "name":  "Finance Analyst",
-        "short": "FN",
-        "color": "#f59e0b",
-        "system": (
-            "You are a finance analyst. Calculate the revenue risk for this customer over the forecast horizon. "
-            "Write 2-3 sentences on the financial exposure and cost-benefit of retaining them. "
-            "End with one cost-effective retention offer with a specific dollar value or discount range. "
-            "No markdown, no bullet points. Use actual revenue numbers."
-        ),
-    },
-    {
-        "name":  "Product Manager",
-        "short": "PM",
-        "color": "#8b5cf6",
-        "system": (
-            "You are a product manager. Examine this customer's feature adoption and usage pattern. "
-            "Write 2-3 sentences on which product gaps are driving their low engagement. "
-            "End with one specific product action — feature unlock, guided tutorial, or usage incentive — "
-            "that would increase retention. No markdown, no bullet points."
-        ),
-    },
-]
+# Prompts for "analyze" mode — agents examine the baseline situation
+AGENT_ANALYZE_SYSTEMS: dict[str, str] = {
+    "Risk Analyst": (
+        "You are a churn risk analyst. Review this customer's churn score, top SHAP risk drivers, "
+        "and trajectory. Write 2-3 sentences identifying the single most critical risk factor and "
+        "its magnitude. End with one concrete, specific intervention that would most reduce churn "
+        "risk for this customer. No markdown, no bullet points. Use actual numbers from the data."
+    ),
+    "Customer Success": (
+        "You are a customer success manager. Analyze this customer's login recency, NPS, sentiment, "
+        "and engagement signals. Write 2-3 sentences diagnosing the root cause of their disengagement. "
+        "End with one specific outreach or re-engagement action you would execute this week, "
+        "tied to the actual metrics. No markdown, no bullet points."
+    ),
+    "Finance Analyst": (
+        "You are a finance analyst. Using the customer's actual revenue and churn probability, "
+        "calculate the expected revenue loss over the forecast horizon. Write 2-3 sentences on "
+        "financial exposure. End with one cost-effective retention offer with a specific "
+        "dollar value or discount percentage that is justified by the revenue at risk. "
+        "No markdown, no bullet points."
+    ),
+    "Product Manager": (
+        "You are a product manager. Examine this customer's feature adoption percentage and usage hours. "
+        "Write 2-3 sentences on which product engagement gaps are driving churn risk. "
+        "End with one specific product action — feature unlock, onboarding sprint, or usage incentive — "
+        "that would close the gap. No markdown, no bullet points."
+    ),
+}
+
+# Prompts for "scenario" mode — agents debate a specific intervention
+AGENT_SCENARIO_SYSTEMS: dict[str, str] = {
+    "Risk Analyst": (
+        "You are a churn risk analyst. Given the customer data and the proposed intervention scenario, "
+        "write 2-3 sentences: estimate by how many percentage points this intervention will reduce "
+        "churn probability, and what residual risk remains if it underperforms. "
+        "Give specific numbers. No markdown, no headers."
+    ),
+    "Customer Success": (
+        "You are a customer success manager. Given the customer data and the proposed intervention, "
+        "write 2-3 sentences: does this intervention address the actual root cause of churn for "
+        "this specific customer? Will it change their behaviour? What must accompany it to succeed? "
+        "Be direct and realistic. No markdown, no headers."
+    ),
+    "Finance Analyst": (
+        "You are a finance analyst. Given the customer data and the proposed intervention, "
+        "write 2-3 sentences: what is the estimated cost of this intervention versus the monthly "
+        "revenue at risk? Is the ROI positive given the churn probability? "
+        "Use specific dollar amounts. No markdown, no headers."
+    ),
+    "Product Manager": (
+        "You are a product manager. Given the customer data and the proposed intervention, "
+        "write 2-3 sentences: how will this affect feature adoption and product engagement? "
+        "Will the customer become more active or stay disengaged? What product change would "
+        "amplify this intervention's effect? No markdown, no headers."
+    ),
+}
 
 
 async def _extract_recommendations(ctx: str, agent_outputs: list, scenario: str = "") -> list:
-    """Extract 3-4 clickable scenario options from agent outputs."""
-    debate_text = "\n".join(f"[{o['name']}]: {o['content'][:400]}" for o in agent_outputs)
-    focus = (
-        f"The agents debated the scenario: \"{scenario}\".\n"
-        if scenario.strip() else
-        "The agents analyzed the customer's baseline churn situation.\n"
+    """Extract 4 clickable scenario options from agent debate outputs."""
+    debate_text = "\n".join(
+        f"[{o['name']}]: {o['content'][:500]}" for o in agent_outputs
     )
+    if scenario.strip():
+        context_note = (
+            f"The agents just debated this intervention: \"{scenario}\".\n"
+            f"Generate 4 FOLLOW-UP or ALTERNATIVE scenarios to simulate next."
+        )
+    else:
+        context_note = (
+            "The agents just analyzed the customer's baseline churn situation.\n"
+            "Generate 4 INTERVENTION scenarios worth simulating."
+        )
+
     prompt = (
-        f"{focus}"
-        f"Based on the agent analyses below, generate exactly 4 specific, actionable intervention options "
-        f"a business analyst could simulate next. Each should be a short question or action phrase "
-        f"(20-80 characters) suitable as a scenario input, written in the same language as the agent outputs. "
-        f"Return ONLY a JSON array of 4 strings. No explanation, no markdown.\n\n"
-        f"Customer context:\n{ctx[:500]}\n\n"
-        f"Agent analyses:\n{debate_text}"
+        f"{context_note}\n\n"
+        f"Rules:\n"
+        f"- Each option must be a short, specific action phrase (15-70 characters)\n"
+        f"- Written in the same language the agents used\n"
+        f"- Concrete enough to use as a simulation scenario input\n"
+        f"- Vary the options (don't repeat the same idea)\n\n"
+        f"Customer context (brief):\n"
+        f"ID: {ctx[:200]}\n\n"
+        f"Agent outputs:\n{debate_text}\n\n"
+        f"Return ONLY a valid JSON array of exactly 4 strings. "
+        f"Example: [\"Offer 20% discount for 3 months\", \"Assign dedicated CSM\", ...]\n"
+        f"No explanation, no markdown fences, no trailing text."
     )
     try:
         raw = await call_llm(
-            "You extract intervention scenario options. Return ONLY a JSON array of 4 strings.",
-            prompt, max_tokens=300,
+            "Extract 4 intervention scenario options. Return ONLY a JSON array of 4 strings.",
+            prompt,
+            max_tokens=400,
         )
+        # Strip think blocks and fences
         raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip()).strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
+        raw = re.sub(r"\s*```\s*$", "", raw, flags=re.MULTILINE).strip()
         start = raw.find("[")
         end   = raw.rfind("]") + 1
         if start >= 0 and end > start:
             items = json.loads(raw[start:end])
-            return [str(x).strip() for x in items if str(x).strip()][:4]
+            cleaned = [str(x).strip() for x in items if str(x).strip()]
+            if cleaned:
+                return cleaned[:4]
     except Exception:
         pass
     return []
 
 
-# Scenario JSON: produces ONLY the projection + updated metric fields (not baseline)
+# ─── Scenario JSON system prompt ──────────────────────────────────────────────
 _SCENARIO_UPDATE_JSON_SYSTEM = """\
 You are a customer retention analytics engine. A multi-agent team has debated an intervention \
 scenario. Based on their analysis, produce a JSON update with ONLY these fields. \
@@ -1221,17 +1222,16 @@ Schema:
 }
 
 Critical rules:
-- projection[0].prob MUST equal the customer's current churn_score exactly (provided below).
-- projection values must generally be LOWER than the baseline (intervention reduces churn).
-- intervention_impact_pct = baseline_final_prob − projection_final_prob (must be positive).
+- projection[0].prob MUST equal the customer's current churn_score exactly.
+- projection values must generally be LOWER than baseline (intervention reduces churn).
+- intervention_impact_pct = baseline_final_prob − projection_final_prob (positive number).
 - segment_migration probs must sum to 1.0; use the same labels as provided.
-- Match the same weekly time-points as the baseline array provided below.
+- Match the same weekly time-points as the baseline provided.
 - Output ONLY the JSON object. No explanation, no markdown fences.
 """
 
 
 def _extract_json(raw: str) -> dict:
-    """Strip think-tags / fences and extract the first JSON object."""
     cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.MULTILINE)
     cleaned = re.sub(r"```\s*$",          "", cleaned, flags=re.MULTILINE).strip()
@@ -1243,33 +1243,43 @@ def _extract_json(raw: str) -> dict:
 
 
 def _clean_narrative(raw: str) -> str:
-    """Strip think tags from narrative text.
-    If the entire output was inside a think block (common with reasoning models
-    that hit their token limit before closing </think>), fall back to stripping
-    just the tag markers and returning the content.
-    """
     if not raw:
         return raw
-    # Remove complete <think>...</think> blocks
     cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
     if cleaned:
         return cleaned
-    # Fallback: just strip the tag markers, keep the content
     return re.sub(r"</?think>", "", raw, flags=re.IGNORECASE).strip()
+
+
+# ─── /simulate endpoint ───────────────────────────────────────────────────────
+
+class SimulateRequest(BaseModel):
+    customer_data:  _CustomerDataSim
+    scenario:       str        = ""
+    chat_history:   list[dict] = []
+    horizon_weeks:  int        = 12
+    segment_labels: list[str]  = []
+    mode:           str        = "initial"  # "initial" | "analyze" | "scenario"
 
 
 @app.post("/simulate")
 async def simulate(request: SimulateRequest):
     """
-    Churn trajectory simulation SSE.
+    Churn trajectory simulation SSE — three modes:
 
-    • No scenario  → single call_llm (JSON) + stream_llm (narrative)  [fast]
-    • With scenario → 4-agent debate (stream) → call_llm (projection JSON) → stream_llm (narrative)
+      initial  → LLM generates trajectory JSON + streams narrative (fast, no agents)
+      analyze  → 4 agents analyze baseline + extract recommendations + brief narrative
+      scenario → 4 agents debate intervention + synthesise projection JSON + narrative
     """
-    c       = request.customer_data
-    ctx     = _build_ctx(c, "")          # scenario injected separately for agents
-    horizon = request.horizon_weeks
+    c        = request.customer_data
+    ctx      = _build_ctx(c, "")
+    horizon  = request.horizon_weeks
     seg_lbls = request.segment_labels or []
+
+    # Determine effective mode (backwards compat: non-empty scenario → scenario mode)
+    mode = request.mode
+    if request.scenario.strip() and mode == "initial":
+        mode = "scenario"
 
     history_block = ""
     if request.chat_history:
@@ -1279,8 +1289,8 @@ async def simulate(request: SimulateRequest):
         ]
         history_block = "\n\nPREVIOUS TURNS:\n" + "\n\n".join(lines)
 
-    # ── shared helpers ────────────────────────────────────────────────────────
-    if horizon <= 8:   _step = 1
+    # Shared helpers
+    if horizon <= 8:    _step = 1
     elif horizon <= 16: _step = 2
     else:               _step = 4
     _fallback_points = list(range(0, horizon + 1, _step))
@@ -1313,32 +1323,47 @@ async def simulate(request: SimulateRequest):
                 {"label": "Retained",  "prob": round((1 - base_score / 100) * 0.6, 3)},
             ]
         result = {
-            "baseline":               baseline,
-            "projection":             None,
-            "retention_window_weeks": max(0, int((80 - base_score) / (base_score * (decay - 1) + 0.5))),
-            "revenue_at_risk":        round(monthly_rev * (mid_prob / 100) * 3, 2),
-            "confidence":             0.6,
+            "baseline":                baseline,
+            "projection":              None,
+            "retention_window_weeks":  max(0, int((80 - base_score) / (base_score * (decay - 1) + 0.5))),
+            "revenue_at_risk":         round(monthly_rev * (mid_prob / 100) * 3, 2),
+            "confidence":              0.6,
             "intervention_impact_pct": None,
-            "segment_migration":      seg_mig,
+            "segment_migration":       seg_mig,
         }
         if exc_msg:
             result["_error"] = exc_msg[:120]
         return result
 
+    async def _run_agents(agent_ctx: str, agent_systems: dict[str, str]) -> list[dict]:
+        """Stream 4 agents and collect their outputs. Yields SSE events."""
+        outputs: list[dict] = []
+        for persona in AGENT_PERSONAS:
+            name   = persona["name"]
+            system = agent_systems.get(name, "You are a customer success expert. Provide a brief analysis.")
+            yield f"data: {json.dumps({'type': 'agent_start', 'agent': name, 'short': persona['short'], 'color': persona['color']})}\n\n"
+            content = ""
+            async for token in stream_llm_no_think(system, agent_ctx, max_tokens=600):
+                content += token
+                yield f"data: {json.dumps({'type': 'agent_token', 'agent': name, 'content': token})}\n\n"
+            outputs.append({"name": name, "content": content})
+            yield f"data: {json.dumps({'type': 'agent_done', 'agent': name})}\n\n"
+        # store outputs in a closure-accessible list
+        _run_agents._last_outputs = outputs  # type: ignore[attr-defined]
+
     # ─────────────────────────────────────────────────────────────────────────
     async def event_stream():
 
         # ══════════════════════════════════════════════════════════════════════
-        # PATH A — Initial run (no scenario)
+        # MODE: initial — fast trajectory + narrative, no agents
         # ══════════════════════════════════════════════════════════════════════
-        if not request.scenario.strip():
+        if mode == "initial":
             yield f"data: {json.dumps({'type': 'thinking'})}\n\n"
 
             sim_data: dict = {}
             try:
-                sim_system = _build_sim_json_system(horizon, seg_lbls)
                 raw = await call_llm(
-                    sim_system,
+                    _build_sim_json_system(horizon, seg_lbls),
                     f"{ctx}{history_block}\n\nGenerate the churn trajectory JSON now.",
                     max_tokens=900,
                 )
@@ -1348,51 +1373,27 @@ async def simulate(request: SimulateRequest):
             except Exception as exc:
                 sim_data = _fallback_sim(str(exc))
 
-            # Compute trajectory-based impact: how much does churn change naturally?
+            # Natural trajectory delta (positive = churn improving, negative = worsening)
             baseline_pts = sim_data.get("baseline", [])
             if len(baseline_pts) >= 2:
-                start_prob = baseline_pts[0].get("prob", c.churn_score)
-                end_prob   = baseline_pts[-1].get("prob", c.churn_score)
-                # Positive = churn risk reduced over horizon, Negative = worsening
-                sim_data["intervention_impact_pct"] = round(start_prob - end_prob, 2)
+                sim_data["intervention_impact_pct"] = round(
+                    baseline_pts[0].get("prob", c.churn_score) -
+                    baseline_pts[-1].get("prob", c.churn_score), 2
+                )
 
             yield f"data: {json.dumps({'type': 'data', 'payload': sim_data})}\n\n"
 
-            # ── Baseline agent analysis ────────────────────────────────────────
             last_pt = baseline_pts[-1] if baseline_pts else {}
-            baseline_ctx = (
-                f"{ctx}{history_block}"
-                f"\n\nBASELINE TRAJECTORY ({horizon}w): "
-                f"Churn probability {c.churn_score:.1f}% → {last_pt.get('prob', c.churn_score):.1f}% "
-                f"at week {last_pt.get('week', horizon)}. "
-                f"Revenue at risk: ${sim_data.get('revenue_at_risk', 0):,.0f}. "
-                f"Retention window: {sim_data.get('retention_window_weeks', '?')}w."
-            )
-            agent_outputs: list[dict] = []
-            for agent in BASELINE_AGENTS:
-                yield f"data: {json.dumps({'type': 'agent_start', 'agent': agent['name'], 'short': agent['short'], 'color': agent['color']})}\n\n"
-                full_content = ""
-                async for token in stream_llm_no_think(agent["system"], baseline_ctx + "\n\nProvide your analysis.", max_tokens=350):
-                    full_content += token
-                    yield f"data: {json.dumps({'type': 'agent_token', 'agent': agent['name'], 'content': token})}\n\n"
-                agent_outputs.append({"name": agent["name"], "content": full_content})
-                yield f"data: {json.dumps({'type': 'agent_done', 'agent': agent['name']})}\n\n"
-
-            # ── Extract clickable recommendations ─────────────────────────────
-            recommendations = await _extract_recommendations(ctx, agent_outputs, scenario="")
-            if recommendations:
-                yield f"data: {json.dumps({'type': 'agent_recommendations', 'recommendations': recommendations})}\n\n"
-
-            # ── Narrative ──────────────────────────────────────────────────────
             narrative_prompt = (
                 f"{ctx}{history_block}"
-                f"\n\nChurn trajectory ({horizon}w): week-0={c.churn_score:.1f}, "
-                f"week-{last_pt.get('week', horizon)}={last_pt.get('prob', c.churn_score):.1f}, "
+                f"\n\nChurn trajectory ({horizon}w): "
+                f"week-0={c.churn_score:.1f}%, "
+                f"week-{last_pt.get('week', horizon)}={last_pt.get('prob', c.churn_score):.1f}%, "
                 f"retention_window={sim_data.get('retention_window_weeks', '?')}w, "
                 f"revenue_at_risk=${sim_data.get('revenue_at_risk', 0):,.0f}."
             )
             full_narrative = ""
-            async for token in stream_llm(_SIM_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=600):
+            async for token in stream_llm(_SIM_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=700):
                 full_narrative += token
                 yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
 
@@ -1400,40 +1401,64 @@ async def simulate(request: SimulateRequest):
             return
 
         # ══════════════════════════════════════════════════════════════════════
-        # PATH B — Scenario run (multi-agent debate)
+        # MODE: analyze — 4 agents examine baseline → recommendations
+        # ══════════════════════════════════════════════════════════════════════
+        if mode == "analyze":
+            # Build context including estimated trajectory
+            fallback = _fallback_sim()
+            last_pt  = fallback.get("baseline", [{}])[-1]
+            agent_ctx = (
+                f"{ctx}{history_block}"
+                f"\n\nFORECAST ({horizon}w): churn {c.churn_score:.1f}% → est. "
+                f"{last_pt.get('prob', c.churn_score):.1f}% at week {horizon}. "
+                f"Revenue at risk: ${fallback.get('revenue_at_risk', 0):,.0f}."
+                f"\n\nProvide your analysis."
+            )
+            agent_outputs: list[dict] = []
+            async for evt in _run_agents(agent_ctx, AGENT_ANALYZE_SYSTEMS):
+                yield evt
+            agent_outputs = getattr(_run_agents, "_last_outputs", [])
+
+            recs = await _extract_recommendations(ctx, agent_outputs, scenario="")
+            if recs:
+                yield f"data: {json.dumps({'type': 'agent_recommendations', 'recommendations': recs})}\n\n"
+
+            # Brief synthesis narrative
+            debate_text = "\n".join(f"[{o['name']}]: {o['content'][:300]}" for o in agent_outputs)
+            narrative_prompt = (
+                f"{ctx}\n\nAGENT ANALYSIS SUMMARY:\n{debate_text[:800]}"
+            )
+            full_narrative = ""
+            async for token in stream_llm(_SIM_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=700):
+                full_narrative += token
+                yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+
+            yield f"data: {json.dumps({'type': 'done', 'narrative': _clean_narrative(full_narrative)})}\n\n"
+            return
+
+        # ══════════════════════════════════════════════════════════════════════
+        # MODE: scenario — 4 agents debate → projection JSON → narrative
         # ══════════════════════════════════════════════════════════════════════
         scenario_block = f"\n\nINTERVENTION SCENARIO: {request.scenario}"
-        agent_outputs: list[dict] = []   # [{name, content}]
+        agent_ctx = f"{ctx}{scenario_block}{history_block}\n\nProvide your analysis."
 
-        # ── Round 1: each agent analyses the scenario ─────────────────────────
-        for agent in SCENARIO_AGENTS:
-            yield f"data: {json.dumps({'type': 'agent_start', 'agent': agent['name'], 'short': agent['short'], 'color': agent['color']})}\n\n"
-            user_msg = f"{ctx}{scenario_block}{history_block}\n\nProvide your analysis."
-            full_content = ""
-            async for token in stream_llm_no_think(agent["system"], user_msg, max_tokens=350):
-                full_content += token
-                yield f"data: {json.dumps({'type': 'agent_token', 'agent': agent['name'], 'content': token})}\n\n"
-            agent_outputs.append({"name": agent["name"], "content": full_content})
-            yield f"data: {json.dumps({'type': 'agent_done', 'agent': agent['name']})}\n\n"
+        agent_outputs_s: list[dict] = []
+        async for evt in _run_agents(agent_ctx, AGENT_SCENARIO_SYSTEMS):
+            yield evt
+        agent_outputs_s = getattr(_run_agents, "_last_outputs", [])
 
-        # ── Extract clickable recommendations from debate ─────────────────────
-        recommendations = await _extract_recommendations(ctx, agent_outputs, scenario=request.scenario)
-        if recommendations:
-            yield f"data: {json.dumps({'type': 'agent_recommendations', 'recommendations': recommendations})}\n\n"
+        # Extract follow-up recommendations
+        recs = await _extract_recommendations(ctx, agent_outputs_s, scenario=request.scenario)
+        if recs:
+            yield f"data: {json.dumps({'type': 'agent_recommendations', 'recommendations': recs})}\n\n"
 
-        # ── Synthesise debate → projection JSON ──────────────────────────────
+        # Synthesise projection JSON
         yield f"data: {json.dumps({'type': 'thinking'})}\n\n"
 
-        debate_text = "\n\n".join(
-            f"[{o['name']}]: {o['content']}" for o in agent_outputs
-        )
-        # Build baseline reference so model knows exact time-points + starting prob
-        baseline_ref = ", ".join(
-            f"week {p}: {c.churn_score:.1f}" if p == 0 else f"week {p}: ?"
-            for p in _fallback_points
-        )
+        debate_text = "\n\n".join(f"[{o['name']}]: {o['content']}" for o in agent_outputs_s)
         monthly_rev = c.segment_rfm_context.get("total_revenue", {}).get("customer", 0)
-        seg_note = f"Segment labels to use: {seg_lbls}" if seg_lbls else "Use standard labels: Churned, High Risk, At Risk, Retained"
+        seg_note    = (f"Segment labels to use: {seg_lbls}" if seg_lbls
+                       else "Use standard labels: Churned, High Risk, At Risk, Retained")
 
         synth_user = (
             f"{ctx}{scenario_block}"
@@ -1446,13 +1471,11 @@ async def simulate(request: SimulateRequest):
 
         update_data: dict = {}
         try:
-            raw = await call_llm(_SCENARIO_UPDATE_JSON_SYSTEM, synth_user, max_tokens=700)
+            raw = await call_llm(_SCENARIO_UPDATE_JSON_SYSTEM, synth_user, max_tokens=800)
             update_data = _extract_json(raw)
-            # Pin week-0
-            if update_data.get("projection") and len(update_data["projection"]) > 0:
+            if update_data.get("projection"):
                 update_data["projection"][0]["prob"] = round(c.churn_score, 2)
         except Exception as exc:
-            # Fallback projection: 30% reduction from baseline
             update_data = {
                 "projection": [
                     {"week": w, "prob": round(min(100, c.churn_score * (0.70 ** (1 + i * 0.15))), 2)}
@@ -1464,23 +1487,21 @@ async def simulate(request: SimulateRequest):
                 "revenue_at_risk":         round(monthly_rev * (c.churn_score * 0.65 / 100) * 3, 2),
                 "_error": str(exc)[:120],
             }
-            if update_data["projection"]:
-                update_data["projection"][0]["prob"] = round(c.churn_score, 2)
+            update_data["projection"][0]["prob"] = round(c.churn_score, 2)
 
         yield f"data: {json.dumps({'type': 'data', 'payload': update_data})}\n\n"
 
-        # ── Narrative: summarise debate + outcome ─────────────────────────────
         proj_last = (update_data.get("projection") or [{}])[-1]
         narrative_prompt = (
             f"{ctx}{scenario_block}"
-            f"\n\nDEBATE SUMMARY:\n{debate_text[:600]}"
-            f"\n\nProjected outcome: churn at week-{proj_last.get('week', horizon)}="
-            f"{proj_last.get('prob', c.churn_score):.1f}%, "
+            f"\n\nDEBATE SUMMARY:\n{debate_text[:800]}"
+            f"\n\nProjected outcome: "
+            f"churn at week-{proj_last.get('week', horizon)}={proj_last.get('prob', c.churn_score):.1f}%, "
             f"intervention_impact={update_data.get('intervention_impact_pct', 0):.0f}pp reduction, "
             f"revenue_at_risk=${update_data.get('revenue_at_risk', 0):,.0f}."
         )
         full_narrative = ""
-        async for token in stream_llm(_SCENARIO_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=600):
+        async for token in stream_llm(_SCENARIO_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=700):
             full_narrative += token
             yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
 
