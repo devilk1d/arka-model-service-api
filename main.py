@@ -1090,6 +1090,9 @@ async def simulate(request: SimulateRequest):
                 "risk_jika_tidak_ditangani": "Risiko churn tinggi dalam 30 hari ke depan",
             }
 
+        # Debug event — visible in frontend debug panel
+        yield f"data: {json.dumps({'type': 'debug', 'full_mod_len': len(full_mod), 'conclusion_keys': list(conclusion.keys())})}\n\n"
+
         # Emit conclusion without debate (already sent as debate_store above)
         yield f"data: {json.dumps({'type': 'conclusion', 'data': conclusion})}\n\n"
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
