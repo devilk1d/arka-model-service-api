@@ -805,52 +805,85 @@ async def predict_single(
 
 from fastapi.responses import StreamingResponse  # noqa: E402
 
+_NO_MD = (
+    "JANGAN gunakan markdown, asterisk (*), tanda bintang, double asterisk (**), "
+    "bullet points, atau formatting apapun. Tulis teks biasa seperti percakapan natural."
+)
+
 AGENT_ORDER = ["Risk Analyst", "Customer Success Manager", "Product Manager", "Finance Analyst"]
 
 AGENT_PERSONAS: dict = {
     "Risk Analyst": {
         "color": "#ef4444",
-        "system": (
-            "Anda adalah Risk Analyst senior spesialis churn prediction. "
-            "Fokus: churn score, faktor SHAP, probabilitas churn, dan dampak risiko bisnis.\n"
-            "Sampaikan analisis tajam dan data-driven dalam 3-4 kalimat. Bahasa Indonesia. Langsung ke poin."
+        "r1": (
+            f"Anda adalah Risk Analyst senior. Fokus: churn score, faktor SHAP, dan dampak risiko bisnis. "
+            f"Berikan analisis awal 2-3 kalimat. Bahasa Indonesia. {_NO_MD}"
+        ),
+        "r2": (
+            f"Anda adalah Risk Analyst senior. Baca argumen rekan tim lalu respond: setuju, tidak setuju, atau tambahkan sudut pandang risiko yang terlewat. "
+            f"2-3 kalimat. Bahasa Indonesia. {_NO_MD}"
+        ),
+        "chat": (
+            f"Anda adalah Risk Analyst senior. Jawab pertanyaan user dari perspektif risiko dan data. "
+            f"Singkat, 1-2 kalimat. Bahasa Indonesia. {_NO_MD}"
         ),
     },
     "Customer Success Manager": {
         "color": "#3b82f6",
-        "system": (
-            "Anda adalah Customer Success Manager senior spesialis retensi. "
-            "Fokus: sentimen customer, feedback, urgency, dan kekuatan hubungan jangka panjang.\n"
-            "Sampaikan perspektif empatis dan customer-centric dalam 3-4 kalimat. Bahasa Indonesia. Langsung ke poin."
+        "r1": (
+            f"Anda adalah Customer Success Manager senior. Fokus: sentimen customer, feedback, dan hubungan jangka panjang. "
+            f"Berikan perspektif awal 2-3 kalimat. Bahasa Indonesia. {_NO_MD}"
+        ),
+        "r2": (
+            f"Anda adalah Customer Success Manager senior. Respond terhadap argumen rekan: dukung, bantah, atau perjelas dari sudut pandang customer. "
+            f"2-3 kalimat. Bahasa Indonesia. {_NO_MD}"
+        ),
+        "chat": (
+            f"Anda adalah Customer Success Manager senior. Jawab pertanyaan user dari perspektif hubungan dan kepuasan customer. "
+            f"Singkat, 1-2 kalimat. Bahasa Indonesia. {_NO_MD}"
         ),
     },
     "Product Manager": {
         "color": "#8b5cf6",
-        "system": (
-            "Anda adalah Product Manager senior. "
-            "Fokus: feature adoption rate, usage pattern, dan apakah customer benar-benar mendapat value dari produk.\n"
-            "Identifikasi gap antara value yang ditawarkan vs dirasakan. 3-4 kalimat. Bahasa Indonesia. Langsung ke poin."
+        "r1": (
+            f"Anda adalah Product Manager senior. Fokus: feature adoption, usage pattern, dan gap antara value ditawarkan vs dirasakan customer. "
+            f"Analisis awal 2-3 kalimat. Bahasa Indonesia. {_NO_MD}"
+        ),
+        "r2": (
+            f"Anda adalah Product Manager senior. Baca argumen tim lalu respond: apa yang didukung, dibantah, atau ditambahkan dari sudut product. "
+            f"2-3 kalimat. Bahasa Indonesia. {_NO_MD}"
+        ),
+        "chat": (
+            f"Anda adalah Product Manager senior. Jawab pertanyaan user dari perspektif product dan adoption. "
+            f"Singkat, 1-2 kalimat. Bahasa Indonesia. {_NO_MD}"
         ),
     },
     "Finance Analyst": {
         "color": "#f59e0b",
-        "system": (
-            "Anda adalah Finance Analyst senior. "
-            "Fokus: revenue customer, payment behavior, CLV, dan ROI dari intervensi yang diusulkan.\n"
-            "Nilai apakah biaya intervensi sepadan. 3-4 kalimat. Bahasa Indonesia. Langsung ke poin."
+        "r1": (
+            f"Anda adalah Finance Analyst senior. Fokus: revenue, CLV, payment behavior, dan ROI dari skenario yang dibahas. "
+            f"Analisis finansial awal 2-3 kalimat. Bahasa Indonesia. {_NO_MD}"
+        ),
+        "r2": (
+            f"Anda adalah Finance Analyst senior. Respond argumen rekan dari sudut finansial: apakah cost-benefit mendukung atau menentang rekomendasi mereka. "
+            f"2-3 kalimat. Bahasa Indonesia. {_NO_MD}"
+        ),
+        "chat": (
+            f"Anda adalah Finance Analyst senior. Jawab pertanyaan user dari sudut finansial dan ROI. "
+            f"Singkat, 1-2 kalimat. Bahasa Indonesia. {_NO_MD}"
         ),
     },
     "Moderator": {
         "color": "#10b981",
         "system": (
-            "Anda adalah Chief Customer Officer yang mensintesis semua argumen dan mengambil keputusan final.\n"
-            "Output HARUS JSON valid tanpa teks lain, tanpa markdown:\n"
+            "Anda adalah Chief Customer Officer. Sintesis seluruh debat dan buat keputusan final. "
+            "Output HARUS berupa JSON valid tanpa teks lain, tanpa markdown, tanpa komentar:\n"
             '{"kesimpulan":"2-3 kalimat keputusan final",'
             '"churn_score_before":0,"churn_score_after":0,"confidence":0,'
-            '"prioritas_aksi":["aksi1","aksi2","aksi3"],'
-            '"timeline":"estimasi waktu melihat hasil",'
-            '"expected_feedback":"prediksi respons customer terhadap intervensi",'
-            '"risk_jika_tidak_ditangani":"konsekuensi jika tidak ada intervensi"}'
+            '"prioritas_aksi":["aksi 1","aksi 2","aksi 3"],'
+            '"timeline":"estimasi waktu melihat hasil intervensi",'
+            '"expected_feedback":"prediksi respons/perilaku customer setelah intervensi",'
+            '"risk_jika_tidak_ditangani":"konsekuensi bisnis jika tidak ada aksi"}'
         ),
     },
 }
@@ -897,13 +930,6 @@ async def stream_llm(system: str, user_msg: str):
         yield f"[Error: {str(exc)[:80]}]"
 
 
-class _InterventionParams(BaseModel):
-    type:        str
-    budget:      float = 0.0
-    urgency:     str   = "medium"
-    description: str   = ""
-
-
 class _CustomerDataSim(BaseModel):
     customer_id:         str
     churn_score:         float
@@ -920,81 +946,112 @@ class _CustomerDataSim(BaseModel):
 
 class SimulateRequest(BaseModel):
     customer_data: _CustomerDataSim
-    intervention:  _InterventionParams
-    user_prompt:   str = ""
+    scenario:      str = ""   # optional: describe a planned intervention scenario
+    user_prompt:   str = ""   # optional: extra context/question for agents
+
+
+class SimulateChatRequest(BaseModel):
+    customer_data:  _CustomerDataSim
+    debate_context: list       # [{agent, content, round}]
+    question:       str
+    scenario:       str = ""
+
+
+def _build_ctx(c: _CustomerDataSim, scenario: str) -> str:
+    rfm      = c.segment_rfm_context
+    shap_txt = "\n".join(
+        f"  - {f['feature_label']}: {f['shap_value']:+.3f} "
+        f"({'meningkatkan' if f['direction'] == 'increases_churn' else 'menurunkan'} risiko)"
+        for f in c.shap_top5
+    )
+    rev      = rfm.get("total_revenue",       {}).get("customer", 0)
+    usage    = rfm.get("monthly_usage_hrs",    {}).get("customer", 0)
+    adoption = rfm.get("feature_adoption_pct", {}).get("customer", 0)
+    nps      = rfm.get("avg_nps_score",        {}).get("customer", 0)
+    dsl      = rfm.get("days_since_login",     {}).get("customer", 0)
+    ctx = (
+        f"CUSTOMER: {c.customer_id} | Plan: {c.plan_type} ({c.contract_type}) | Segment: {c.segment_label}\n"
+        f"Churn Score: {c.churn_score}/100 | Risk: {c.risk_level}\n"
+        f"Revenue: ${rev:,.0f}/mo | Usage: {usage:.0f}h/mo | Feature Adoption: {adoption:.0f}% | NPS: {nps:.1f}/10\n"
+        f"Days since login: {dsl:.0f}\n"
+        f"Sentiment: {c.sentiment.get('label', 'N/A')} "
+        f"(VADER: {c.sentiment.get('vader_compound', 0):+.3f}) | "
+        f"Urgency: {c.sentiment.get('urgency_level', 'N/A')}\n"
+        f"Feedback: \"{c.sentiment.get('feedback_preview', '')[:200]}\"\n"
+        f"NLP Red Flag: {'Ya' if c.nlp_red_flag else 'Tidak'} | "
+        f"Loyalty Risk: {'Ya' if c.loyalty_risk_flag else 'Tidak'}\n\n"
+        f"FAKTOR UTAMA (SHAP):\n{shap_txt}"
+    )
+    if scenario.strip():
+        ctx += f"\n\nSKENARIO YANG DIPERTIMBANGKAN:\n{scenario}"
+    return ctx
 
 
 @app.post("/simulate")
 async def simulate(request: SimulateRequest):
-    """Multi-agent debate SSE endpoint. Streams 4 analyst turns then moderator conclusion."""
-    c  = request.customer_data
-    iv = request.intervention
-
-    def build_context() -> str:
-        rfm      = c.segment_rfm_context
-        shap_txt = "\n".join(
-            f"  - {f['feature_label']}: {f['shap_value']:+.3f} "
-            f"({'meningkatkan' if f['direction'] == 'increases_churn' else 'menurunkan'} risiko)"
-            for f in c.shap_top5
-        )
-        rev      = rfm.get("total_revenue",       {}).get("customer", 0)
-        usage    = rfm.get("monthly_usage_hrs",    {}).get("customer", 0)
-        adoption = rfm.get("feature_adoption_pct", {}).get("customer", 0)
-        nps      = rfm.get("avg_nps_score",        {}).get("customer", 0)
-        dsl      = rfm.get("days_since_login",     {}).get("customer", 0)
-        return (
-            f"CUSTOMER: {c.customer_id} | Plan: {c.plan_type} ({c.contract_type}) | Segment: {c.segment_label}\n"
-            f"Churn Score: {c.churn_score}/100 | Risk: {c.risk_level}\n"
-            f"Revenue: ${rev:,.0f}/mo | Usage: {usage:.0f}h/mo | Feature Adoption: {adoption:.0f}% | NPS: {nps:.1f}/10\n"
-            f"Days since login: {dsl:.0f}\n"
-            f"Sentiment: {c.sentiment.get('label', 'N/A')} "
-            f"(VADER: {c.sentiment.get('vader_compound', 0):+.3f}) | "
-            f"Urgency: {c.sentiment.get('urgency_level', 'N/A')}\n"
-            f"Feedback: \"{c.sentiment.get('feedback_preview', '')[:200]}\"\n"
-            f"NLP Red Flag: {'Ya' if c.nlp_red_flag else 'Tidak'} | "
-            f"Loyalty Risk: {'Ya' if c.loyalty_risk_flag else 'Tidak'}\n\n"
-            f"FAKTOR UTAMA (SHAP):\n{shap_txt}\n\n"
-            f"INTERVENSI DIUSULKAN:\n"
-            f"Tipe: {iv.type} | Budget: ${iv.budget:,.0f} | Urgency: {iv.urgency}\n"
-            f"Deskripsi: {iv.description}"
-        )
+    """Two-round multi-agent debate SSE. Moderator synthesises silently at the end."""
+    ctx   = _build_ctx(request.customer_data, request.scenario)
+    extra = f"\n\nKonteks tambahan: {request.user_prompt}" if request.user_prompt.strip() else ""
 
     async def event_stream():
-        debate: list[dict] = []
-        ctx   = build_context()
-        extra = f"\n\nKonteks tambahan: {request.user_prompt}" if request.user_prompt.strip() else ""
+        all_msgs: list[dict] = []
+
+        # ── Round 1: Initial analysis ─────────────────────────────────────────
+        yield f"data: {json.dumps({'type': 'round_start', 'round': 1, 'label': 'Analisis Awal'})}\n\n"
 
         for agent_name in AGENT_ORDER:
             persona  = AGENT_PERSONAS[agent_name]
+            # Each agent in Round 1 sees what earlier agents said in this round
             history  = (
-                "\n\nARGUMEN REKAN SEBELUMNYA:\n"
-                + "\n\n".join(f"[{h['agent']}]: {h['content']}" for h in debate)
-            ) if debate else ""
-            user_msg = f"{ctx}{history}{extra}\n\nBerikan analisis Anda dari perspektif {agent_name}."
+                "\n\nArgumen rekan sebelumnya:\n"
+                + "\n\n".join(f"[{m['agent']}]: {m['content']}" for m in all_msgs)
+            ) if all_msgs else ""
+            user_msg = f"{ctx}{history}{extra}\n\nBerikan analisis awal Anda."
 
-            yield f"data: {json.dumps({'type': 'agent_start', 'agent': agent_name, 'color': persona['color']})}\n\n"
+            yield f"data: {json.dumps({'type': 'agent_start', 'agent': agent_name, 'color': persona['color'], 'round': 1})}\n\n"
             full = ""
-            async for token in stream_llm(persona["system"], user_msg):
+            async for token in stream_llm(persona["r1"], user_msg):
                 full += token
                 yield f"data: {json.dumps({'type': 'token', 'agent': agent_name, 'content': token})}\n\n"
-            debate.append({"agent": agent_name, "content": full})
-            yield f"data: {json.dumps({'type': 'agent_done', 'agent': agent_name})}\n\n"
+            all_msgs.append({"agent": agent_name, "content": full, "round": 1})
+            yield f"data: {json.dumps({'type': 'agent_done', 'agent': agent_name, 'round': 1})}\n\n"
 
-        # ── Moderator synthesises ──────────────────────────────────────────────
-        mod      = AGENT_PERSONAS["Moderator"]
-        hist_all = "\n\nHASIL DEBAT:\n" + "\n\n".join(
-            f"[{h['agent']}]: {h['content']}" for h in debate
+        yield f"data: {json.dumps({'type': 'round_end', 'round': 1})}\n\n"
+
+        # ── Round 2: Rebuttal ─────────────────────────────────────────────────
+        yield f"data: {json.dumps({'type': 'round_start', 'round': 2, 'label': 'Debat & Respons'})}\n\n"
+
+        r1_block = "\n\nARGUMEN RONDE PERTAMA:\n" + "\n\n".join(
+            f"[{m['agent']}]: {m['content']}" for m in all_msgs if m["round"] == 1
         )
-        mod_msg  = f"{ctx}{hist_all}{extra}\n\nBerikan sintesis dan keputusan final dalam format JSON."
 
-        yield f"data: {json.dumps({'type': 'agent_start', 'agent': 'Moderator', 'color': mod['color']})}\n\n"
-        full_mod = ""
-        async for token in stream_llm(mod["system"], mod_msg):
-            full_mod += token
-            yield f"data: {json.dumps({'type': 'token', 'agent': 'Moderator', 'content': token})}\n\n"
-        yield f"data: {json.dumps({'type': 'agent_done', 'agent': 'Moderator'})}\n\n"
+        for agent_name in AGENT_ORDER:
+            persona  = AGENT_PERSONAS[agent_name]
+            user_msg = (
+                f"{ctx}{r1_block}{extra}"
+                f"\n\nRespond terhadap argumen rekan dari perspektif {agent_name}. "
+                f"Setuju, tidak setuju, atau tambahkan hal yang belum dibahas."
+            )
+            yield f"data: {json.dumps({'type': 'agent_start', 'agent': agent_name, 'color': persona['color'], 'round': 2})}\n\n"
+            full = ""
+            async for token in stream_llm(persona["r2"], user_msg):
+                full += token
+                yield f"data: {json.dumps({'type': 'token', 'agent': agent_name, 'content': token})}\n\n"
+            all_msgs.append({"agent": agent_name, "content": full, "round": 2})
+            yield f"data: {json.dumps({'type': 'agent_done', 'agent': agent_name, 'round': 2})}\n\n"
 
-        # ── Parse JSON conclusion ─────────────────────────────────────────────
+        yield f"data: {json.dumps({'type': 'round_end', 'round': 2})}\n\n"
+
+        # ── Moderator: silent synthesis via call_llm (no streaming in feed) ───
+        yield f"data: {json.dumps({'type': 'moderator_thinking'})}\n\n"
+
+        mod          = AGENT_PERSONAS["Moderator"]
+        full_debate  = "\n\nSELURUH DEBAT:\n" + "\n\n".join(
+            f"[{m['agent']} - Ronde {m['round']}]: {m['content']}" for m in all_msgs
+        )
+        mod_input    = f"{mod['system']}\n\n{ctx}{full_debate}\n\nSintesis semua argumen dan berikan keputusan final dalam JSON."
+        full_mod     = await call_llm(mod_input)
+
         conclusion: dict = {}
         try:
             cleaned    = re.sub(r"<think>.*?</think>", "", full_mod, flags=re.DOTALL).strip()
@@ -1003,8 +1060,8 @@ async def simulate(request: SimulateRequest):
         except Exception:
             conclusion = {
                 "kesimpulan":                full_mod,
-                "churn_score_before":        c.churn_score,
-                "churn_score_after":         c.churn_score,
+                "churn_score_before":        request.customer_data.churn_score,
+                "churn_score_after":         request.customer_data.churn_score,
                 "confidence":                0,
                 "prioritas_aksi":            [],
                 "timeline":                  "",
@@ -1012,7 +1069,42 @@ async def simulate(request: SimulateRequest):
                 "risk_jika_tidak_ditangani": "",
             }
 
-        yield f"data: {json.dumps({'type': 'conclusion', 'data': conclusion, 'debate': debate})}\n\n"
+        yield f"data: {json.dumps({'type': 'conclusion', 'data': conclusion, 'debate': all_msgs})}\n\n"
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
+
+
+@app.post("/simulate/chat")
+async def simulate_chat(request: SimulateChatRequest):
+    """Post-simulation Q&A: all 4 analyst agents answer the user's question briefly."""
+    ctx = _build_ctx(request.customer_data, request.scenario)
+    debate_summary = "\n\nRINGKASAN DEBAT SEBELUMNYA:\n" + "\n\n".join(
+        f"[{m['agent']} Ronde {m.get('round', 1)}]: {str(m['content'])[:300]}"
+        for m in request.debate_context[-8:]
+    )
+
+    async def event_stream():
+        yield f"data: {json.dumps({'type': 'chat_start', 'question': request.question})}\n\n"
+
+        for agent_name in AGENT_ORDER:
+            persona  = AGENT_PERSONAS[agent_name]
+            user_msg = (
+                f"{ctx}{debate_summary}"
+                f"\n\nPertanyaan: {request.question}"
+                f"\n\nJawab dari perspektif {agent_name}."
+            )
+            yield f"data: {json.dumps({'type': 'agent_start', 'agent': agent_name, 'color': persona['color'], 'is_chat': True})}\n\n"
+            full = ""
+            async for token in stream_llm(persona["chat"], user_msg):
+                full += token
+                yield f"data: {json.dumps({'type': 'token', 'agent': agent_name, 'content': token})}\n\n"
+            yield f"data: {json.dumps({'type': 'agent_done', 'agent': agent_name, 'is_chat': True})}\n\n"
+
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(
