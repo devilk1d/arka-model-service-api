@@ -1057,25 +1057,35 @@ Rules:
 """
 
 _SIM_NARRATIVE_SYSTEM = """\
-You are a senior customer success analyst writing a concise retention briefing.
-Write EXACTLY 3-4 sentences of flowing prose IN INDONESIAN (Bahasa Indonesia) covering:
-1. The customer's current churn risk level and score
-2. The top 1-2 drivers behind this trajectory (use SHAP factor names and numbers)
-3. The single most important recommended action with a specific timeline
+Kamu adalah analis customer success senior di perusahaan SaaS.
+Tulis TEPAT 3-4 kalimat dalam Bahasa Indonesia yang mengalir, mencakup:
+1. Kondisi risiko churn pelanggan saat ini dan penyebab utamanya (sebut faktor SHAP dengan angkanya)
+2. Proyeksi trajektori: ke mana probabilitas churn bergerak dalam periode ini
+3. Window retensi dan eksposur finansial yang perlu diwaspadai
+4. Satu tindakan prioritas yang paling mendesak dengan timeline konkret
 
-Rules: No bullet points. No headers. No markdown. Reference actual numbers from the data.
-Output the prose directly — do not wrap it in any tags or preamble.
+Aturan: Tanpa bullet point. Tanpa header. Tanpa markdown.
+Tulis narasinya langsung — tidak perlu pembuka atau penutup.
 """
 
 _SCENARIO_NARRATIVE_SYSTEM = """\
-You are a senior customer success analyst summarising a multi-agent intervention debate.
-Write EXACTLY 3-4 sentences of flowing prose IN INDONESIAN (Bahasa Indonesia) covering:
-1. What the scenario proposes and the projected churn probability reduction (use the numbers)
-2. The strongest pro and con from the agent debate (one sentence)
-3. The recommended next action with a specific timeline
+Kamu adalah analis customer success senior di perusahaan SaaS.
+Tulis TEPAT 3-4 kalimat dalam Bahasa Indonesia yang mengalir, mencakup:
+1. Apa yang diusulkan skenario ini dan proyeksi penurunan probabilitas churn (gunakan angkanya)
+2. Argumen pro dan kontra terkuat dari debat tim analis (satu kalimat)
+3. Tindakan selanjutnya yang direkomendasikan dengan timeline spesifik
 
-Rules: No bullet points. No headers. No markdown.
-Output the prose directly — do not wrap it in any tags or preamble.
+Aturan: Tanpa bullet point. Tanpa header. Tanpa markdown.
+Tulis narasinya langsung — tidak perlu pembuka atau penutup.
+"""
+
+_ASK_SYSTEM = """\
+Kamu adalah asisten analitik customer success yang ahli di perusahaan SaaS.
+Jawab pertanyaan pengguna berdasarkan data pelanggan dan konteks simulasi yang tersedia.
+Gunakan Bahasa Indonesia yang profesional dan mudah dipahami oleh tim bisnis.
+Format: 2-4 paragraf singkat atau poin-poin ringkas yang relevan.
+Sertakan angka dari data jika relevan. Hindari markdown berlebihan.
+Jawab langsung tanpa kalimat pembuka seperti "Tentu saja" atau "Berdasarkan data".
 """
 
 # ─── Unified Agent Config ─────────────────────────────────────────────────────
@@ -1088,60 +1098,71 @@ AGENT_PERSONAS = [
     {"name": "Product Manager", "short": "PM", "color": "#8b5cf6"},
 ]
 
-# Prompts for "analyze" mode — agents examine the baseline situation
+# Prompts for "initial" mode — agents examine baseline situation in Indonesian
 AGENT_ANALYZE_SYSTEMS: dict[str, str] = {
     "Risk Analyst": (
-        "You are a churn risk analyst. Review this customer's churn score, top SHAP risk drivers, "
-        "and trajectory. Write 2-3 sentences identifying the single most critical risk factor and "
-        "its magnitude. End with one concrete, specific intervention that would most reduce churn "
-        "risk for this customer. No markdown, no bullet points. Use actual numbers from the data."
+        "Kamu adalah Analis Risiko Churn di perusahaan SaaS. "
+        "Tinjau skor churn, faktor risiko SHAP teratas, dan trajektori pelanggan ini. "
+        "Tulis 2-3 kalimat: identifikasi faktor risiko PALING kritis dan seberapa besar dampaknya. "
+        "Akhiri dengan SATU rekomendasi konkret yang paling efektif untuk mengurangi risiko churn ini. "
+        "Gunakan angka aktual dari data. Tanpa markdown, tanpa bullet point. "
+        "Bahasa Indonesia yang ringkas dan profesional."
     ),
     "Customer Success": (
-        "You are a customer success manager. Analyze this customer's login recency, NPS, sentiment, "
-        "and engagement signals. Write 2-3 sentences diagnosing the root cause of their disengagement. "
-        "End with one specific outreach or re-engagement action you would execute this week, "
-        "tied to the actual metrics. No markdown, no bullet points."
+        "Kamu adalah Customer Success Manager di perusahaan SaaS. "
+        "Analisis waktu login terakhir, skor NPS, sentimen feedback, dan sinyal keterlibatan pelanggan ini. "
+        "Tulis 2-3 kalimat: apa akar masalah ketidakaktifan atau ketidakpuasan mereka? "
+        "Akhiri dengan SATU tindakan outreach atau re-engagement spesifik yang bisa dilakukan minggu ini, "
+        "berdasarkan data aktual. Tanpa markdown, tanpa bullet point. "
+        "Bahasa Indonesia yang ringkas dan profesional."
     ),
     "Finance Analyst": (
-        "You are a finance analyst. Using the customer's actual revenue and churn probability, "
-        "calculate the expected revenue loss over the forecast horizon. Write 2-3 sentences on "
-        "financial exposure. End with one cost-effective retention offer with a specific "
-        "dollar value or discount percentage that is justified by the revenue at risk. "
-        "No markdown, no bullet points."
+        "Kamu adalah Analis Keuangan di perusahaan SaaS. "
+        "Gunakan data revenue dan probabilitas churn pelanggan ini untuk menghitung potensi kerugian pendapatan. "
+        "Tulis 2-3 kalimat tentang eksposur finansial perusahaan jika pelanggan ini churn. "
+        "Akhiri dengan SATU penawaran retensi hemat biaya—diskon spesifik atau nilai konkret—yang "
+        "dapat dijustifikasi dengan nilai revenue yang berisiko. Tanpa markdown, tanpa bullet point. "
+        "Bahasa Indonesia yang ringkas dan profesional."
     ),
     "Product Manager": (
-        "You are a product manager. Examine this customer's feature adoption percentage and usage hours. "
-        "Write 2-3 sentences on which product engagement gaps are driving churn risk. "
-        "End with one specific product action — feature unlock, onboarding sprint, or usage incentive — "
-        "that would close the gap. No markdown, no bullet points."
+        "Kamu adalah Product Manager di perusahaan SaaS. "
+        "Periksa tingkat adopsi fitur dan jam penggunaan produk pelanggan ini. "
+        "Tulis 2-3 kalimat: kesenjangan keterlibatan produk mana yang paling berkontribusi pada risiko churn? "
+        "Akhiri dengan SATU tindakan produk spesifik—unlock fitur, sprint onboarding, atau insentif penggunaan—"
+        "yang dapat menutup kesenjangan tersebut. Tanpa markdown, tanpa bullet point. "
+        "Bahasa Indonesia yang ringkas dan profesional."
     ),
 }
 
-# Prompts for "scenario" mode — agents debate a specific intervention
+# Prompts for "scenario" mode — agents debate a specific intervention in Indonesian
 AGENT_SCENARIO_SYSTEMS: dict[str, str] = {
     "Risk Analyst": (
-        "You are a churn risk analyst. Given the customer data and the proposed intervention scenario, "
-        "write 2-3 sentences: estimate by how many percentage points this intervention will reduce "
-        "churn probability, and what residual risk remains if it underperforms. "
-        "Give specific numbers. No markdown, no headers."
+        "Kamu adalah Analis Risiko Churn di perusahaan SaaS. "
+        "Berdasarkan data pelanggan dan skenario intervensi yang diusulkan, "
+        "tulis 2-3 kalimat: berapa poin persentase intervensi ini akan mengurangi probabilitas churn? "
+        "Apa risiko sisa jika intervensi tidak berjalan sesuai rencana? Berikan angka spesifik. "
+        "Tanpa markdown, tanpa header. Bahasa Indonesia yang ringkas dan profesional."
     ),
     "Customer Success": (
-        "You are a customer success manager. Given the customer data and the proposed intervention, "
-        "write 2-3 sentences: does this intervention address the actual root cause of churn for "
-        "this specific customer? Will it change their behaviour? What must accompany it to succeed? "
-        "Be direct and realistic. No markdown, no headers."
+        "Kamu adalah Customer Success Manager di perusahaan SaaS. "
+        "Berdasarkan data pelanggan dan intervensi yang diusulkan, "
+        "tulis 2-3 kalimat: apakah intervensi ini menyentuh akar masalah churn pelanggan ini secara tepat? "
+        "Apa yang harus menyertainya agar berhasil? Jadilah realistis dan langsung. "
+        "Tanpa markdown, tanpa header. Bahasa Indonesia yang ringkas dan profesional."
     ),
     "Finance Analyst": (
-        "You are a finance analyst. Given the customer data and the proposed intervention, "
-        "write 2-3 sentences: what is the estimated cost of this intervention versus the monthly "
-        "revenue at risk? Is the ROI positive given the churn probability? "
-        "Use specific dollar amounts. No markdown, no headers."
+        "Kamu adalah Analis Keuangan di perusahaan SaaS. "
+        "Berdasarkan data pelanggan dan intervensi yang diusulkan, "
+        "tulis 2-3 kalimat: berapa estimasi biaya intervensi ini dibanding revenue bulanan yang berisiko? "
+        "Apakah ROI-nya positif mengingat probabilitas churn saat ini? Gunakan angka konkret. "
+        "Tanpa markdown, tanpa header. Bahasa Indonesia yang ringkas dan profesional."
     ),
     "Product Manager": (
-        "You are a product manager. Given the customer data and the proposed intervention, "
-        "write 2-3 sentences: how will this affect feature adoption and product engagement? "
-        "Will the customer become more active or stay disengaged? What product change would "
-        "amplify this intervention's effect? No markdown, no headers."
+        "Kamu adalah Product Manager di perusahaan SaaS. "
+        "Berdasarkan data pelanggan dan intervensi yang diusulkan, "
+        "tulis 2-3 kalimat: bagaimana ini akan mempengaruhi adopsi fitur dan keterlibatan produk? "
+        "Perubahan produk apa yang akan memperkuat efek intervensi ini secara signifikan? "
+        "Tanpa markdown, tanpa header. Bahasa Indonesia yang ringkas dan profesional."
     ),
 }
 
@@ -1153,28 +1174,28 @@ async def _extract_recommendations(ctx: str, agent_outputs: list, scenario: str 
     )
     if scenario.strip():
         context_note = (
-            f"The agents just debated this intervention: \"{scenario}\".\n"
-            f"Generate 4 FOLLOW-UP or ALTERNATIVE scenarios to simulate next."
+            f"Tim analis baru saja mendiskusikan intervensi ini: \"{scenario}\".\n"
+            f"Buat 4 skenario LANJUTAN atau ALTERNATIF yang layak disimulasikan berikutnya."
         )
     else:
         context_note = (
-            "The agents just analyzed the customer's baseline churn situation.\n"
-            "Generate 4 INTERVENTION scenarios worth simulating."
+            "Tim analis baru saja menganalisis situasi churn baseline pelanggan ini.\n"
+            "Buat 4 skenario INTERVENSI yang layak disimulasikan untuk mengurangi risiko churn."
         )
 
     prompt = (
         f"{context_note}\n\n"
-        f"Rules:\n"
-        f"- Each option must be a short, specific action phrase (15-70 characters)\n"
-        f"- Written in the same language the agents used\n"
-        f"- Concrete enough to use as a simulation scenario input\n"
-        f"- Vary the options (don't repeat the same idea)\n\n"
-        f"Customer context (brief):\n"
-        f"ID: {ctx[:200]}\n\n"
-        f"Agent outputs:\n{debate_text}\n\n"
-        f"Return ONLY a valid JSON array of exactly 4 strings. "
-        f"Example: [\"Offer 20% discount for 3 months\", \"Assign dedicated CSM\", ...]\n"
-        f"No explanation, no markdown fences, no trailing text."
+        f"Aturan:\n"
+        f"- Setiap opsi harus berupa frasa tindakan pendek dan spesifik (15-70 karakter)\n"
+        f"- Tulis dalam Bahasa Indonesia\n"
+        f"- Cukup konkret untuk dijadikan input skenario simulasi\n"
+        f"- Bervariasi — jangan mengulang ide yang sama\n\n"
+        f"Konteks pelanggan:\n"
+        f"{ctx[:200]}\n\n"
+        f"Output analisis agen:\n{debate_text}\n\n"
+        f"Kembalikan HANYA array JSON valid berisi tepat 4 string. "
+        f"Contoh: [\"Tawarkan diskon 20% selama 3 bulan\", \"Assign CSM dedicated\", ...]\n"
+        f"Tanpa penjelasan, tanpa markdown fence, tanpa teks tambahan."
     )
     try:
         raw = await call_llm(
@@ -1259,7 +1280,7 @@ class SimulateRequest(BaseModel):
     chat_history:   list[dict] = []
     horizon_weeks:  int        = 12
     segment_labels: list[str]  = []
-    mode:           str        = "initial"  # "initial" | "analyze" | "scenario"
+    mode:           str        = "initial"  # "initial" | "scenario" | "ask"
 
 
 @app.post("/simulate")
@@ -1276,10 +1297,12 @@ async def simulate(request: SimulateRequest):
     horizon  = request.horizon_weeks
     seg_lbls = request.segment_labels or []
 
-    # Determine effective mode (backwards compat: non-empty scenario → scenario mode)
+    # Normalise mode (backwards compat: non-empty scenario → scenario mode)
     mode = request.mode
-    if request.scenario.strip() and mode == "initial":
+    if request.scenario.strip() and mode not in ("scenario", "ask"):
         mode = "scenario"
+    if mode == "analyze":          # legacy compat
+        mode = "initial"
 
     history_block = ""
     if request.chat_history:
@@ -1355,7 +1378,23 @@ async def simulate(request: SimulateRequest):
     async def event_stream():
 
         # ══════════════════════════════════════════════════════════════════════
-        # MODE: initial — fast trajectory + narrative, no agents
+        # MODE: ask — Q&A about customer/results, no chart update
+        # ══════════════════════════════════════════════════════════════════════
+        if mode == "ask":
+            question = request.scenario.strip() or "Berikan ringkasan kondisi pelanggan ini."
+            ask_prompt = (
+                f"{ctx}{history_block}"
+                f"\n\nPERTANYAAN PENGGUNA: {question}"
+            )
+            full_answer = ""
+            async for token in stream_llm_no_think(_ASK_SYSTEM, ask_prompt, max_tokens=650):
+                full_answer += token
+                yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'narrative': _clean_narrative(full_answer)})}\n\n"
+            return
+
+        # ══════════════════════════════════════════════════════════════════════
+        # MODE: initial — trajectory JSON → 4 agents → recommendations → narrative
         # ══════════════════════════════════════════════════════════════════════
         if mode == "initial":
             yield f"data: {json.dumps({'type': 'thinking'})}\n\n"
@@ -1373,7 +1412,7 @@ async def simulate(request: SimulateRequest):
             except Exception as exc:
                 sim_data = _fallback_sim(str(exc))
 
-            # Natural trajectory delta (positive = churn improving, negative = worsening)
+            # Natural trajectory delta (positive = improving / negative = worsening)
             baseline_pts = sim_data.get("baseline", [])
             if len(baseline_pts) >= 2:
                 sim_data["intervention_impact_pct"] = round(
@@ -1383,50 +1422,34 @@ async def simulate(request: SimulateRequest):
 
             yield f"data: {json.dumps({'type': 'data', 'payload': sim_data})}\n\n"
 
-            last_pt = baseline_pts[-1] if baseline_pts else {}
-            narrative_prompt = (
-                f"{ctx}{history_block}"
-                f"\n\nChurn trajectory ({horizon}w): "
-                f"week-0={c.churn_score:.1f}%, "
-                f"week-{last_pt.get('week', horizon)}={last_pt.get('prob', c.churn_score):.1f}%, "
-                f"retention_window={sim_data.get('retention_window_weeks', '?')}w, "
-                f"revenue_at_risk=${sim_data.get('revenue_at_risk', 0):,.0f}."
-            )
-            full_narrative = ""
-            async for token in stream_llm(_SIM_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=700):
-                full_narrative += token
-                yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
-
-            yield f"data: {json.dumps({'type': 'done', 'narrative': _clean_narrative(full_narrative)})}\n\n"
-            return
-
-        # ══════════════════════════════════════════════════════════════════════
-        # MODE: analyze — 4 agents examine baseline → recommendations
-        # ══════════════════════════════════════════════════════════════════════
-        if mode == "analyze":
-            # Build context including estimated trajectory
-            fallback = _fallback_sim()
-            last_pt  = fallback.get("baseline", [{}])[-1]
+            # Run 4 agents after trajectory is sent
+            last_pt   = baseline_pts[-1] if baseline_pts else {}
             agent_ctx = (
                 f"{ctx}{history_block}"
-                f"\n\nFORECAST ({horizon}w): churn {c.churn_score:.1f}% → est. "
-                f"{last_pt.get('prob', c.churn_score):.1f}% at week {horizon}. "
-                f"Revenue at risk: ${fallback.get('revenue_at_risk', 0):,.0f}."
-                f"\n\nProvide your analysis."
+                f"\n\nPROYEKSI ({horizon} minggu): churn {c.churn_score:.1f}% → "
+                f"{last_pt.get('prob', c.churn_score):.1f}% pada minggu ke-{horizon}. "
+                f"Revenue berisiko: ${sim_data.get('revenue_at_risk', 0):,.0f}."
+                f"\n\nBerikan analisis Anda."
             )
-            agent_outputs: list[dict] = []
             async for evt in _run_agents(agent_ctx, AGENT_ANALYZE_SYSTEMS):
                 yield evt
             agent_outputs = getattr(_run_agents, "_last_outputs", [])
 
+            # Extract recommendations
             recs = await _extract_recommendations(ctx, agent_outputs, scenario="")
             if recs:
                 yield f"data: {json.dumps({'type': 'agent_recommendations', 'recommendations': recs})}\n\n"
 
-            # Brief synthesis narrative
+            # Stream narrative summary
             debate_text = "\n".join(f"[{o['name']}]: {o['content'][:300]}" for o in agent_outputs)
             narrative_prompt = (
-                f"{ctx}\n\nAGENT ANALYSIS SUMMARY:\n{debate_text[:800]}"
+                f"{ctx}{history_block}"
+                f"\n\nTrajektori churn ({horizon} minggu): "
+                f"minggu-0={c.churn_score:.1f}%, "
+                f"minggu-{last_pt.get('week', horizon)}={last_pt.get('prob', c.churn_score):.1f}%, "
+                f"window_retensi={sim_data.get('retention_window_weeks', '?')} minggu, "
+                f"revenue_berisiko=${sim_data.get('revenue_at_risk', 0):,.0f}."
+                f"\n\nRINGKASAN ANALISIS TIM:\n{debate_text[:600]}"
             )
             full_narrative = ""
             async for token in stream_llm(_SIM_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=700):
@@ -1439,8 +1462,8 @@ async def simulate(request: SimulateRequest):
         # ══════════════════════════════════════════════════════════════════════
         # MODE: scenario — 4 agents debate → projection JSON → narrative
         # ══════════════════════════════════════════════════════════════════════
-        scenario_block = f"\n\nINTERVENTION SCENARIO: {request.scenario}"
-        agent_ctx = f"{ctx}{scenario_block}{history_block}\n\nProvide your analysis."
+        scenario_block = f"\n\nSKENARIO INTERVENSI: {request.scenario}"
+        agent_ctx = f"{ctx}{scenario_block}{history_block}\n\nBerikan analisis Anda."
 
         agent_outputs_s: list[dict] = []
         async for evt in _run_agents(agent_ctx, AGENT_SCENARIO_SYSTEMS):
@@ -1457,15 +1480,15 @@ async def simulate(request: SimulateRequest):
 
         debate_text = "\n\n".join(f"[{o['name']}]: {o['content']}" for o in agent_outputs_s)
         monthly_rev = c.segment_rfm_context.get("total_revenue", {}).get("customer", 0)
-        seg_note    = (f"Segment labels to use: {seg_lbls}" if seg_lbls
-                       else "Use standard labels: Churned, High Risk, At Risk, Retained")
+        seg_note    = (f"Gunakan label segmen: {seg_lbls}" if seg_lbls
+                       else "Gunakan label standar: Churned, High Risk, At Risk, Retained")
 
         synth_user = (
             f"{ctx}{scenario_block}"
-            f"\n\nBASELINE TIME POINTS (weeks): {_fallback_points}"
-            f"\nMONTHLY REVENUE: ${monthly_rev:,.0f}"
+            f"\n\nTITIK WAKTU BASELINE (minggu): {_fallback_points}"
+            f"\nREVENUE BULANAN: ${monthly_rev:,.0f}"
             f"\n{seg_note}"
-            f"\n\nMULTI-AGENT DEBATE:\n{debate_text}"
+            f"\n\nDEBAT MULTI-AGEN:\n{debate_text}"
             f"\n\nGenerate the scenario update JSON now."
         )
 
@@ -1494,11 +1517,11 @@ async def simulate(request: SimulateRequest):
         proj_last = (update_data.get("projection") or [{}])[-1]
         narrative_prompt = (
             f"{ctx}{scenario_block}"
-            f"\n\nDEBATE SUMMARY:\n{debate_text[:800]}"
-            f"\n\nProjected outcome: "
-            f"churn at week-{proj_last.get('week', horizon)}={proj_last.get('prob', c.churn_score):.1f}%, "
-            f"intervention_impact={update_data.get('intervention_impact_pct', 0):.0f}pp reduction, "
-            f"revenue_at_risk=${update_data.get('revenue_at_risk', 0):,.0f}."
+            f"\n\nRINGKASAN DEBAT:\n{debate_text[:800]}"
+            f"\n\nHasil proyeksi: "
+            f"churn minggu-{proj_last.get('week', horizon)}={proj_last.get('prob', c.churn_score):.1f}%, "
+            f"dampak_intervensi={update_data.get('intervention_impact_pct', 0):.0f}pp pengurangan, "
+            f"revenue_berisiko=${update_data.get('revenue_at_risk', 0):,.0f}."
         )
         full_narrative = ""
         async for token in stream_llm(_SCENARIO_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=700):
