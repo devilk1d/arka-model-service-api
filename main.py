@@ -1063,25 +1063,28 @@ Rules:
 
 _SIM_NARRATIVE_SYSTEM = """\
 Kamu adalah analis customer success senior di perusahaan SaaS.
-Tulis TEPAT 3-4 kalimat dalam Bahasa Indonesia yang mengalir, mencakup:
-1. Kondisi risiko churn pelanggan saat ini dan penyebab utamanya (sebut faktor SHAP dengan angkanya)
-2. Proyeksi trajektori: ke mana probabilitas churn bergerak dalam periode ini
-3. Window retensi dan eksposur finansial yang perlu diwaspadai
-4. Satu tindakan prioritas yang paling mendesak dengan timeline konkret
+Tulis TEPAT 4 paragraf singkat (2-3 kalimat per paragraf) dalam Bahasa Indonesia yang bermakna:
 
-Aturan: Tanpa bullet point. Tanpa header. Tanpa markdown.
-Tulis narasinya langsung — tidak perlu pembuka atau penutup.
+Paragraf 1: Kondisi risiko churn saat ini — sebut skor, faktor SHAP utama beserta angkanya, dan apa artinya bagi akun ini.
+Paragraf 2: Proyeksi trajektori — ke mana probabilitas churn bergerak selama periode ini dan faktor pendorongnya.
+Paragraf 3: Window retensi dan eksposur finansial — berapa lama waktu tersisa dan berapa revenue yang berisiko hilang.
+Paragraf 4: Satu tindakan prioritas paling mendesak dengan timeline konkret dan ekspektasi hasilnya.
+
+Pisahkan setiap paragraf dengan satu baris kosong.
+Aturan: Tanpa bullet point. Tanpa header. Tanpa markdown. Tulis langsung tanpa pembuka.
 """
 
 _SCENARIO_NARRATIVE_SYSTEM = """\
 Kamu adalah analis customer success senior di perusahaan SaaS.
-Tulis TEPAT 3-4 kalimat dalam Bahasa Indonesia yang mengalir, mencakup:
-1. Apa yang diusulkan skenario ini dan proyeksi penurunan probabilitas churn (gunakan angkanya)
-2. Argumen pro dan kontra terkuat dari debat tim analis (satu kalimat)
-3. Tindakan selanjutnya yang direkomendasikan dengan timeline spesifik
+Tulis TEPAT 4 paragraf singkat (2-3 kalimat per paragraf) dalam Bahasa Indonesia yang bermakna:
 
-Aturan: Tanpa bullet point. Tanpa header. Tanpa markdown.
-Tulis narasinya langsung — tidak perlu pembuka atau penutup.
+Paragraf 1: Apa yang diusulkan skenario ini dan proyeksi perubahan probabilitas churn (gunakan angka spesifik).
+Paragraf 2: Argumen pro terkuat mengapa intervensi ini berpotensi berhasil berdasarkan data pelanggan.
+Paragraf 3: Risiko atau kontra dari skenario ini — apa yang bisa gagal dan kondisi apa yang perlu dipenuhi.
+Paragraf 4: Langkah konkret berikutnya dengan timeline spesifik dan metrik keberhasilan yang bisa diukur.
+
+Pisahkan setiap paragraf dengan satu baris kosong.
+Aturan: Tanpa bullet point. Tanpa header. Tanpa markdown. Tulis langsung tanpa pembuka.
 """
 
 _ASK_SYSTEM = """\
@@ -1108,33 +1111,41 @@ AGENT_ANALYZE_SYSTEMS: dict[str, str] = {
     "Risk Analyst": (
         "Kamu adalah Analis Risiko Churn di perusahaan SaaS. "
         "Tinjau skor churn, faktor risiko SHAP teratas, dan trajektori pelanggan ini. "
-        "Tulis 2-3 kalimat: identifikasi faktor risiko PALING kritis dan seberapa besar dampaknya. "
-        "Akhiri dengan SATU rekomendasi konkret yang paling efektif untuk mengurangi risiko churn ini. "
-        "Gunakan angka aktual dari data. Tanpa markdown, tanpa bullet point. "
-        "Bahasa Indonesia yang ringkas dan profesional."
+        "Berikan analisis dalam format poin-poin (3-4 poin) menggunakan bullet point (-):\n"
+        "- Identifikasi faktor risiko paling kritis beserta nilai SHAP aktualnya\n"
+        "- Dampak setiap faktor terhadap probabilitas churn\n"
+        "- Tren yang perlu diwaspadai\n"
+        "- Satu rekomendasi konkret paling efektif\n"
+        "Gunakan angka aktual. Bahasa Indonesia yang ringkas dan profesional."
     ),
     "Customer Success": (
         "Kamu adalah Customer Success Manager di perusahaan SaaS. "
         "Analisis waktu login terakhir, skor NPS, sentimen feedback, dan sinyal keterlibatan pelanggan ini. "
-        "Tulis 2-3 kalimat: apa akar masalah ketidakaktifan atau ketidakpuasan mereka? "
-        "Akhiri dengan SATU tindakan outreach atau re-engagement spesifik yang bisa dilakukan minggu ini, "
-        "berdasarkan data aktual. Tanpa markdown, tanpa bullet point. "
+        "Berikan analisis dalam format poin-poin (3-4 poin) menggunakan bullet point (-):\n"
+        "- Akar masalah ketidakaktifan atau ketidakpuasan utama\n"
+        "- Sinyal keterlibatan yang perlu diperhatikan\n"
+        "- Kondisi sentimen pelanggan saat ini\n"
+        "- Satu tindakan outreach spesifik yang bisa dilakukan minggu ini\n"
         "Bahasa Indonesia yang ringkas dan profesional."
     ),
     "Finance Analyst": (
         "Kamu adalah Analis Keuangan di perusahaan SaaS. "
-        "Gunakan data revenue dan probabilitas churn pelanggan ini untuk menghitung potensi kerugian pendapatan. "
-        "Tulis 2-3 kalimat tentang eksposur finansial perusahaan jika pelanggan ini churn. "
-        "Akhiri dengan SATU penawaran retensi hemat biaya—diskon spesifik atau nilai konkret—yang "
-        "dapat dijustifikasi dengan nilai revenue yang berisiko. Tanpa markdown, tanpa bullet point. "
+        "Gunakan data revenue dan probabilitas churn pelanggan ini. "
+        "Berikan analisis dalam format poin-poin (3-4 poin) menggunakan bullet point (-):\n"
+        "- Estimasi potensi kerugian revenue jika pelanggan churn (dalam angka)\n"
+        "- Konteks nilai pelanggan vs rata-rata segmen\n"
+        "- Kelayakan ekonomi dari intervensi retensi\n"
+        "- Satu penawaran retensi hemat biaya dengan nilai konkret\n"
         "Bahasa Indonesia yang ringkas dan profesional."
     ),
     "Product Manager": (
         "Kamu adalah Product Manager di perusahaan SaaS. "
         "Periksa tingkat adopsi fitur dan jam penggunaan produk pelanggan ini. "
-        "Tulis 2-3 kalimat: kesenjangan keterlibatan produk mana yang paling berkontribusi pada risiko churn? "
-        "Akhiri dengan SATU tindakan produk spesifik—unlock fitur, sprint onboarding, atau insentif penggunaan—"
-        "yang dapat menutup kesenjangan tersebut. Tanpa markdown, tanpa bullet point. "
+        "Berikan analisis dalam format poin-poin (3-4 poin) menggunakan bullet point (-):\n"
+        "- Kesenjangan adopsi fitur yang paling berkontribusi pada risiko churn\n"
+        "- Pola penggunaan yang mengkhawatirkan\n"
+        "- Fitur potensial yang belum dimanfaatkan\n"
+        "- Satu tindakan produk spesifik untuk menutup kesenjangan tersebut\n"
         "Bahasa Indonesia yang ringkas dan profesional."
     ),
 }
@@ -1144,30 +1155,42 @@ AGENT_SCENARIO_SYSTEMS: dict[str, str] = {
     "Risk Analyst": (
         "Kamu adalah Analis Risiko Churn di perusahaan SaaS. "
         "Berdasarkan data pelanggan dan skenario intervensi yang diusulkan, "
-        "tulis 2-3 kalimat: berapa poin persentase intervensi ini akan mengurangi probabilitas churn? "
-        "Apa risiko sisa jika intervensi tidak berjalan sesuai rencana? Berikan angka spesifik. "
-        "Tanpa markdown, tanpa header. Bahasa Indonesia yang ringkas dan profesional."
+        "berikan analisis dalam format poin-poin (3-4 poin) menggunakan bullet point (-):\n"
+        "- Estimasi pengurangan probabilitas churn (dalam poin persentase)\n"
+        "- Faktor risiko yang paling terpengaruh oleh intervensi ini\n"
+        "- Risiko sisa jika intervensi tidak berjalan sesuai rencana\n"
+        "- Probabilitas keberhasilan intervensi ini\n"
+        "Bahasa Indonesia yang ringkas dan profesional."
     ),
     "Customer Success": (
         "Kamu adalah Customer Success Manager di perusahaan SaaS. "
         "Berdasarkan data pelanggan dan intervensi yang diusulkan, "
-        "tulis 2-3 kalimat: apakah intervensi ini menyentuh akar masalah churn pelanggan ini secara tepat? "
-        "Apa yang harus menyertainya agar berhasil? Jadilah realistis dan langsung. "
-        "Tanpa markdown, tanpa header. Bahasa Indonesia yang ringkas dan profesional."
+        "berikan analisis dalam format poin-poin (3-4 poin) menggunakan bullet point (-):\n"
+        "- Apakah intervensi ini menyentuh akar masalah churn secara tepat?\n"
+        "- Kondisi pelanggan yang mendukung atau menghambat keberhasilan\n"
+        "- Yang harus menyertai intervensi ini agar berhasil\n"
+        "- Timeline pelaksanaan yang realistis\n"
+        "Bahasa Indonesia yang ringkas dan profesional."
     ),
     "Finance Analyst": (
         "Kamu adalah Analis Keuangan di perusahaan SaaS. "
         "Berdasarkan data pelanggan dan intervensi yang diusulkan, "
-        "tulis 2-3 kalimat: berapa estimasi biaya intervensi ini dibanding revenue bulanan yang berisiko? "
-        "Apakah ROI-nya positif mengingat probabilitas churn saat ini? Gunakan angka konkret. "
-        "Tanpa markdown, tanpa header. Bahasa Indonesia yang ringkas dan profesional."
+        "berikan analisis dalam format poin-poin (3-4 poin) menggunakan bullet point (-):\n"
+        "- Estimasi biaya intervensi vs revenue bulanan yang berisiko\n"
+        "- Kalkulasi ROI jika intervensi berhasil (gunakan angka konkret)\n"
+        "- Break-even point intervensi ini\n"
+        "- Rekomendasi dari perspektif finansial\n"
+        "Bahasa Indonesia yang ringkas dan profesional."
     ),
     "Product Manager": (
         "Kamu adalah Product Manager di perusahaan SaaS. "
         "Berdasarkan data pelanggan dan intervensi yang diusulkan, "
-        "tulis 2-3 kalimat: bagaimana ini akan mempengaruhi adopsi fitur dan keterlibatan produk? "
-        "Perubahan produk apa yang akan memperkuat efek intervensi ini secara signifikan? "
-        "Tanpa markdown, tanpa header. Bahasa Indonesia yang ringkas dan profesional."
+        "berikan analisis dalam format poin-poin (3-4 poin) menggunakan bullet point (-):\n"
+        "- Dampak intervensi terhadap adopsi fitur dan keterlibatan produk\n"
+        "- Fitur atau alur yang paling relevan untuk intervensi ini\n"
+        "- Perubahan produk yang akan memperkuat efek intervensi\n"
+        "- Metrik produk yang harus dimonitor\n"
+        "Bahasa Indonesia yang ringkas dan profesional."
     ),
 }
 
@@ -1413,12 +1436,13 @@ def _clean_narrative(raw: str) -> str:
 # ─── /simulate endpoint ───────────────────────────────────────────────────────
 
 class SimulateRequest(BaseModel):
-    customer_data:  _CustomerDataSim
-    scenario:       str        = ""
-    chat_history:   list[dict] = []
-    horizon_weeks:  int        = 12
-    segment_labels: list[str]  = []
-    mode:           str        = "initial"  # "initial" | "scenario" | "ask"
+    customer_data:          _CustomerDataSim
+    compare_customer_data:  _CustomerDataSim | None = None
+    scenario:               str        = ""
+    chat_history:           list[dict] = []
+    horizon_weeks:          int        = 12
+    segment_labels:         list[str]  = []
+    mode:                   str        = "initial"  # "initial" | "scenario" | "ask"
 
 
 @app.post("/simulate")
@@ -1430,10 +1454,12 @@ async def simulate(request: SimulateRequest):
       analyze  → 4 agents analyze baseline + extract recommendations + brief narrative
       scenario → 4 agents debate intervention + synthesise projection JSON + narrative
     """
-    c        = request.customer_data
-    ctx      = _build_ctx(c, "")
-    horizon  = request.horizon_weeks
-    seg_lbls = request.segment_labels or []
+    c         = request.customer_data
+    cc        = request.compare_customer_data  # may be None
+    ctx       = _build_ctx(c, "")
+    ctx_b     = _build_ctx(cc, "") if cc else ""
+    horizon   = request.horizon_weeks
+    seg_lbls  = request.segment_labels or []
 
     # Normalise mode (backwards compat: non-empty scenario → scenario mode)
     mode = request.mode
@@ -1534,9 +1560,16 @@ async def simulate(request: SimulateRequest):
         # ══════════════════════════════════════════════════════════════════════
         if mode == "ask":
             question = request.scenario.strip() or "Berikan ringkasan kondisi pelanggan ini."
+            compare_note = ""
+            if cc:
+                compare_note = (
+                    f"\n\nCOMPARE CUSTOMER B: {cc.customer_id} | Churn: {cc.churn_score:.1f}% | "
+                    f"Risk: {cc.risk_level} | Segment: {cc.segment_label} | Plan: {cc.plan_type}"
+                )
             ask_prompt = (
-                f"{ctx}{history_block}"
+                f"{ctx}{compare_note}{history_block}"
                 f"\n\nPERTANYAAN PENGGUNA: {question}"
+                + ("\n\nJawab dengan mempertimbangkan konteks KEDUA pelanggan jika relevan." if cc else "")
             )
             full_answer = ""
             async for token in stream_llm_no_think(_ASK_SYSTEM, ask_prompt, max_tokens=650):
@@ -1587,7 +1620,7 @@ async def simulate(request: SimulateRequest):
                 yield evt
             agent_outputs = getattr(_run_agents, "_last_outputs", [])
 
-            # Extract recommendations
+            # Extract recommendations for primary customer
             recs = await _extract_recommendations(
                 ctx, agent_outputs, scenario="",
                 risk_level=c.risk_level,
@@ -1599,19 +1632,42 @@ async def simulate(request: SimulateRequest):
                     "shap_top5":      c.shap_top5,
                 },
             )
-            if recs:
-                yield f"data: {json.dumps({'type': 'agent_recommendations', 'recommendations': recs})}\n\n"
+            # Extract recommendations for compare customer if present
+            compare_recs: list[str] = []
+            if cc:
+                compare_recs = await _extract_recommendations(
+                    ctx_b, agent_outputs, scenario="",
+                    risk_level=cc.risk_level,
+                    customer_profile={
+                        "segment_label": cc.segment_label,
+                        "plan_type":     cc.plan_type,
+                        "contract_type": cc.contract_type,
+                        "churn_score":   cc.churn_score,
+                        "shap_top5":     cc.shap_top5,
+                    },
+                )
+            if recs or compare_recs:
+                evt_payload: dict = {"type": "agent_recommendations", "recommendations": recs}
+                if compare_recs:
+                    evt_payload["compare_recommendations"] = compare_recs
+                yield f"data: {json.dumps(evt_payload)}\n\n"
 
             # Stream narrative summary
             debate_text = "\n".join(f"[{o['name']}]: {o['content'][:300]}" for o in agent_outputs)
+            compare_ctx_note = ""
+            if cc:
+                compare_ctx_note = (
+                    f"\n\nCOMPARE CUSTOMER B: {cc.customer_id} | Churn: {cc.churn_score:.1f}% | Risk: {cc.risk_level} | Segment: {cc.segment_label}"
+                )
             narrative_prompt = (
-                f"{ctx}{history_block}"
+                f"{ctx}{compare_ctx_note}{history_block}"
                 f"\n\nTrajektori churn ({horizon} minggu): "
                 f"minggu-0={c.churn_score:.1f}%, "
                 f"minggu-{last_pt.get('week', horizon)}={last_pt.get('prob', c.churn_score):.1f}%, "
                 f"window_retensi={sim_data.get('retention_window_weeks', '?')} minggu, "
                 f"revenue_berisiko=${sim_data.get('revenue_at_risk', 0):,.0f}."
-                f"\n\nRINGKASAN ANALISIS TIM:\n{debate_text[:600]}"
+                + (f" | Compare B churn: {cc.churn_score:.1f}% Risk: {cc.risk_level}" if cc else "")
+                + f"\n\nRINGKASAN ANALISIS TIM:\n{debate_text[:600]}"
             )
             full_narrative = ""
             async for token in stream_llm(_SIM_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=700):
@@ -1625,14 +1681,20 @@ async def simulate(request: SimulateRequest):
         # MODE: scenario — 4 agents debate → projection JSON → narrative
         # ══════════════════════════════════════════════════════════════════════
         scenario_block = f"\n\nSKENARIO INTERVENSI: {request.scenario}"
-        agent_ctx = f"{ctx}{scenario_block}{history_block}\n\nBerikan analisis Anda."
+        compare_note_s = ""
+        if cc:
+            compare_note_s = (
+                f"\n\nCOMPARE CUSTOMER B: {cc.customer_id} | Churn: {cc.churn_score:.1f}% | "
+                f"Risk: {cc.risk_level} | Segment: {cc.segment_label}"
+            )
+        agent_ctx = f"{ctx}{compare_note_s}{scenario_block}{history_block}\n\nBerikan analisis Anda."
 
         agent_outputs_s: list[dict] = []
         async for evt in _run_agents(agent_ctx, AGENT_SCENARIO_SYSTEMS):
             yield evt
         agent_outputs_s = getattr(_run_agents, "_last_outputs", [])
 
-        # Extract follow-up recommendations
+        # Extract follow-up recommendations for primary customer
         recs = await _extract_recommendations(
             ctx, agent_outputs_s, scenario=request.scenario,
             risk_level=c.risk_level,
@@ -1644,8 +1706,24 @@ async def simulate(request: SimulateRequest):
                 "shap_top5":      c.shap_top5,
             },
         )
-        if recs:
-            yield f"data: {json.dumps({'type': 'agent_recommendations', 'recommendations': recs})}\n\n"
+        compare_recs_s: list[str] = []
+        if cc:
+            compare_recs_s = await _extract_recommendations(
+                ctx_b, agent_outputs_s, scenario=request.scenario,
+                risk_level=cc.risk_level,
+                customer_profile={
+                    "segment_label": cc.segment_label,
+                    "plan_type":     cc.plan_type,
+                    "contract_type": cc.contract_type,
+                    "churn_score":   cc.churn_score,
+                    "shap_top5":     cc.shap_top5,
+                },
+            )
+        if recs or compare_recs_s:
+            evt_payload_s: dict = {"type": "agent_recommendations", "recommendations": recs}
+            if compare_recs_s:
+                evt_payload_s["compare_recommendations"] = compare_recs_s
+            yield f"data: {json.dumps(evt_payload_s)}\n\n"
 
         # Synthesise projection JSON
         yield f"data: {json.dumps({'type': 'thinking'})}\n\n"
@@ -1687,8 +1765,11 @@ async def simulate(request: SimulateRequest):
         yield f"data: {json.dumps({'type': 'data', 'payload': update_data})}\n\n"
 
         proj_last = (update_data.get("projection") or [{}])[-1]
+        compare_proj_note = ""
+        if cc:
+            compare_proj_note = f"\n\nCOMPARE B: {cc.customer_id} churn {cc.churn_score:.1f}% ({cc.risk_level}) — skenario berlaku untuk kedua pelanggan."
         narrative_prompt = (
-            f"{ctx}{scenario_block}"
+            f"{ctx}{scenario_block}{compare_proj_note}"
             f"\n\nRINGKASAN DEBAT:\n{debate_text[:800]}"
             f"\n\nHasil proyeksi: "
             f"churn minggu-{proj_last.get('week', horizon)}={proj_last.get('prob', c.churn_score):.1f}%, "
