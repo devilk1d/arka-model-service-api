@@ -26,31 +26,30 @@ app.add_middleware(
 # ─── Load artifacts ───────────────────────────────────────────────────────────
 print("Loading artifacts...")
 
-A = joblib.load(os.getenv("ARTIFACTS_PATH", "churn_artifacts_v1.pkl"))
-NLP = joblib.load(os.getenv("NLP_ARTIFACTS_PATH", "nlp_artifacts_v2.pkl"))
+A = joblib.load(os.getenv("ARTIFACTS_PATH", "arka_model_artifacts.pkl"))
+NLP = joblib.load(os.getenv("NLP_ARTIFACTS_PATH", "arka_nlp_artifacts.pkl"))
 
-# v10 saves both best model and calibrated model — prefer calibrated
-# The calibrated model gives better probability estimates (lower Brier score)
-# and is fitted on the full dataset via CalibratedClassifierCV(cv=5, method='isotonic')
-MODEL            = A.get("calibrated_model") or A["model"]
-FEATURES         = A["production_features"]
-LE_PLAN          = A["le_plan"]
-LE_CONTRACT      = A["le_contract"]
-SCALER_SEG       = A["scaler_seg"]
-KMEANS           = A["kmeans"]
-LABEL_MAP        = A["cluster_label_map"]
-SEG_FEATURES     = A["seg_features"]               # ['days_since_login','payment_count','log_revenue','log_usage','feature_adoption_pct','avg_nps_score']
-SEG_PROFILES     = A["segment_profiles"]
-SEG_DESCRIPTIONS = A.get("segment_descriptions", {})  # new in v10
-PLAN_ACTIONS     = A.get("plan_actions", {})           # new in v10: per-plan retain/offer options
-RISK_LOW         = A["risk_thresholds"]["low"]
-RISK_HIGH        = A["risk_thresholds"]["high"]
-REF              = pd.Timestamp(A["reference_date"])
-CV_VEC           = A["cv_vec"]
-LDA              = A["lda"]
-TOPIC_NAMES      = A["topic_names"]
-URGENCY_LEX      = A["urgency_lexicon"]
-N_TOPICS         = A["n_topics"]
+# Notebook 1 (churn_artifacts_v2.pkl) — best model (no calibration wrapper in v2.1)
+MODEL        = A.get("calibrated_model") or A["model"]
+FEATURES     = A["production_features"]
+LE_PLAN      = A["le_plan"]
+LE_CONTRACT  = A["le_contract"]
+SCALER_SEG   = A["scaler_seg"]
+KMEANS       = A["kmeans"]
+LABEL_MAP    = A["cluster_label_map"]
+SEG_FEATURES = A["seg_features"]   # ['days_since_login','payment_count','log_revenue','log_usage','feature_adoption_pct','avg_nps_score']
+SEG_PROFILES = A["seg_profiles"]   # list of dicts per segment cluster (notebook 1 key = seg_profiles)
+SEG_ACTIONS  = A["seg_actions"]    # dict keyed by segment label: {description, retain, offer, priority}
+RISK_LOW     = A["risk_thresholds"]["low"]
+RISK_HIGH    = A["risk_thresholds"]["high"]
+REF          = pd.Timestamp(A["reference_date"])
+
+# Notebook 2 (nlp_artifacts_v2.pkl) — LDA / topic / urgency artefacts live here, NOT in churn pkl
+CV_VEC      = NLP["cv_vec"]
+LDA         = NLP["lda"]
+TOPIC_NAMES = NLP["topic_names"]
+URGENCY_LEX = NLP["urgency_lexicon"]
+N_TOPICS    = NLP["n_topics"]
 
 # ─── NLP Sentiment artifacts (dari nlp_artifacts_v2.pkl / notebook section 7) ─
 TFIDF_SENT           = NLP["tfidf_sent"]
@@ -82,9 +81,9 @@ LLM_KEY   = os.getenv("OLLAMA_API_KEY",  "")
 LLM_MODEL = os.getenv("OLLAMA_MODEL",    "qwen3.5:397b-cloud")
 FUSION_ALPHA = float(os.getenv("FUSION_ALPHA", "1.0"))  # v10: single calibrated model, no NLP fusion
 
-print("✅ Artifacts loaded (v10 — calibrated model active)")
+print("✅ Artifacts loaded (v2.1 — best model active)")
 print(f"   model_version : {A.get('model_version', 'unknown')}")
-print(f"   model_name    : {A.get('model_name', 'unknown')}")
+print(f"   model_name    : {A.get('best_model_name', 'unknown')}")
 print(f"   has_calibrated: {'calibrated_model' in A}")
 print(f"   SEG_FEATURES  : {SEG_FEATURES}")
 print(f"   FEATURES count: {len(FEATURES)}")
@@ -238,16 +237,19 @@ def compute_nlp_flags(master: pd.DataFrame) -> pd.DataFrame:
 # ─── Core pipeline ─────────────────────────────────────────────────────────────
 def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     """
-    Full pipeline aligned with v10 notebook.
-    Key differences vs v9:
-      - Uses calibrated_model (not raw best model)
+    Full pipeline aligned with notebook_1 (churn_artifacts_v2.pkl) and
+    notebook_2 (nlp_artifacts_v2.pkl).
+
+    Key facts vs legacy version:
+      - MODEL      = best raw model (LightGBM/XGBoost/GBM) — no calibration wrapper
+      - iso_reg    = IdentityMapping (passthrough); raw probabilities are used directly
+      - SEG_ACTIONS keyed by segment label (not by plan_type)
+      - CV_VEC / LDA / TOPIC_NAMES / URGENCY_LEX / N_TOPICS loaded from NLP artifact
+      - PRODUCTION_FEATURES comes from A["production_features"]
       - tenure_capped (<=365) used for dunning_per_tenure interaction feature
-      - ticket_per_revenue uses log_total_revenue (+1e-3) denominator (not raw revenue)
+      - ticket_per_revenue uses log_total_revenue (+1e-3) denominator
       - nps_x_dunning multiplied by has_nps_data mask
       - SEG_FEATURES uses log_revenue / log_usage (pre-computed)
-      - avg_words_per_sent included in VADER features
-      - nlp_red_flag and loyalty_risk_flag added to output
-      - segment_descriptions and plan_actions from artifact
     """
     # ── Clean ──────────────────────────────────────────────────────────────────
     ca_df  = ca_df.copy()
@@ -440,13 +442,13 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
         seg_prof = next((p for p in SEG_PROFILES if p["segment_label"] == seg), {})
         centroid = centroid_df.iloc[seg_cl].to_dict()
 
-        # Plan-based retain/offer actions (v10: PLAN_ACTIONS keyed by plan_type)
-        plan_act = PLAN_ACTIONS.get(row["plan_type"], {})
-        seg_act  = {
-            "description": SEG_DESCRIPTIONS.get(seg, ""),
-            "retain":      plan_act.get("retain", []),
-            "offer":       plan_act.get("offer",  []),
-            "priority":    row["risk_level"],
+        # Segment actions — keyed by segment label in notebook 1's SEG_ACTIONS artifact
+        seg_action_data = SEG_ACTIONS.get(seg, {})
+        seg_act = {
+            "description": seg_action_data.get("description", ""),
+            "retain":      seg_action_data.get("retain", []),
+            "offer":       seg_action_data.get("offer",  []),
+            "priority":    seg_action_data.get("priority", row["risk_level"]),
         }
 
         # centroid keys = SEG_FEATURES = ['days_since_login','payment_count',
@@ -759,10 +761,10 @@ def health():
     has_calibrated = "calibrated_model" in A
     return {
         "status":          "ok",
-        "model_version":   A.get("model_version", "v10.0"),
+        "model_version":   A.get("model_version", "v2.1"),
         "model_type":      model_type,
         "calibrated":      has_calibrated,
-        "model_name":      A.get("model_name", "unknown"),
+        "model_name":      A.get("best_model_name", "unknown"),
         "risk_low":        RISK_LOW,
         "risk_high":       RISK_HIGH,
         "fusion_alpha":    FUSION_ALPHA,
