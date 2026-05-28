@@ -1,4 +1,4 @@
-import os, json, io, warnings, re
+import os, sys, json, io, warnings, re
 warnings.filterwarnings("ignore")
 
 import pandas as pd
@@ -23,11 +23,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ─── IdentityMapping ──────────────────────────────────────────────────────────
+# Notebook 1 (v2.1) replaces isotonic calibration with this passthrough wrapper
+# and saves it as `iso_reg` inside churn_artifacts_v2.pkl.
+# Pickle serialises it as `__main__.IdentityMapping`, so we must:
+#   1. define the class here, and
+#   2. register it in sys.modules['__main__'] BEFORE joblib.load() is called.
+# Without step 2, uvicorn's own __main__ (the binary) won't have the class and
+# deserialization raises AttributeError.
+class IdentityMapping:
+    """Passthrough calibrator — returns raw probabilities unchanged."""
+    def predict(self, x):
+        return x
+
+sys.modules["__main__"].IdentityMapping = IdentityMapping
+
 # ─── Load artifacts ───────────────────────────────────────────────────────────
 print("Loading artifacts...")
 
-A = joblib.load(os.getenv("ARTIFACTS_PATH", "arka_model_artifacts.pkl"))
-NLP = joblib.load(os.getenv("NLP_ARTIFACTS_PATH", "arka_nlp_artifacts.pkl"))
+A = joblib.load(os.getenv("ARTIFACTS_PATH", "churn_artifacts_v2.pkl"))
+NLP = joblib.load(os.getenv("NLP_ARTIFACTS_PATH", "nlp_artifacts_v2.pkl"))
 
 # Notebook 1 (churn_artifacts_v2.pkl) — best model (no calibration wrapper in v2.1)
 MODEL        = A.get("calibrated_model") or A["model"]
@@ -140,15 +155,22 @@ def extract_sent_features(text: str) -> list:
 
 
 def map_sentiment_tier(proba: float) -> str:
-    """4-tier label seperti notebook cell 7.4."""
-    if proba < 0.15:
+    """
+    4-tier label sesuai notebook 2 baru (map_sentiment_tier_optimized, cell 7.4).
+    Threshold dioptimasi berdasarkan distribusi model aktual:
+      < 0.20 → Satisfied
+      < 0.50 → Neutral/Stable
+      < 0.80 → At Risk (Unsatisfied)
+      else   → Critical (Dissatisfied)
+    """
+    if proba < 0.20:
         return "Satisfied"
     elif proba < 0.50:
-        return "Fairly Satisfied"
-    elif proba < 0.85:
-        return "Fairly Dissatisfied"
+        return "Neutral/Stable"
+    elif proba < 0.80:
+        return "At Risk (Unsatisfied)"
     else:
-        return "Dissatisfied"
+        return "Critical (Dissatisfied)"
 
 
 def predict_sentiment(text: str) -> dict:
