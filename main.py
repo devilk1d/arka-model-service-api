@@ -27,6 +27,7 @@ app.add_middleware(
 print("Loading artifacts...")
 
 A = joblib.load(os.getenv("ARTIFACTS_PATH", "churn_artifacts_v1.pkl"))
+NLP = joblib.load(os.getenv("NLP_ARTIFACTS_PATH", "nlp_artifacts_v2.pkl"))
 
 # v10 saves both best model and calibrated model — prefer calibrated
 # The calibrated model gives better probability estimates (lower Brier score)
@@ -51,6 +52,22 @@ TOPIC_NAMES      = A["topic_names"]
 URGENCY_LEX      = A["urgency_lexicon"]
 N_TOPICS         = A["n_topics"]
 
+# ─── NLP Sentiment artifacts (dari nlp_artifacts_v2.pkl / notebook section 7) ─
+TFIDF_SENT           = NLP["tfidf_sent"]
+SENT_LGBM            = NLP["sent_lgbm"]
+SCALER_SENT          = NLP["scaler_sent"]
+CHURN_INTENT_LEXICON = NLP["churn_intent_lexicon"]
+NEG_PATTERNS = [
+    r"not\s+\w*\s*(good|great|satisfied|worth|happy|working|reliable|stable|clear)",
+    r"(issue|problem|bug|error|crash|fail|broken|slow|bad|poor|terrible|horrible|awful|nightmare|frustrat)",
+    r"(can't|cannot|unable|impossible|doesn't|won't|wouldn't)\s+\w+",
+    r"(worst|never|useless|waste|refund|overcharged|unexpected\s+fee|charged\s+twice)",
+]
+POSITIVE_ANCHORS = [
+    "great","excellent","fantastic","love","amazing","perfect","best","recommend","happy","outstanding"
+]
+CONTRAST_PATTERN = r"\b(but|however|although|yet|despite|while|though|even though|nevertheless)\b"
+
 # SHAP explainer — v10 stores it directly in the artifact bundle
 # For CalibratedClassifierCV we need the underlying base estimator
 EXPLAINER = A.get("explainer")
@@ -73,6 +90,8 @@ print(f"   SEG_FEATURES  : {SEG_FEATURES}")
 print(f"   FEATURES count: {len(FEATURES)}")
 print(f"   RISK_LOW/HIGH : {RISK_LOW} / {RISK_HIGH}")
 print(f"   N_TOPICS      : {N_TOPICS}")
+print(f"✅ NLP Artifacts loaded (sentiment: TF-IDF + LightGBM, 4-tier)")
+print(f"   nlp_auc_cv    : {NLP.get('nlp_auc_cv', 'unknown')}")
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 def risk_level(score: float) -> str:
@@ -93,13 +112,72 @@ def get_top_shap(shap_row: pd.Series, top_n: int = 5) -> list:
     ]
 
 
-# ─── NLP / VADER pipeline (v10: VADER features only, no NLP-LR fusion) ────────
+# ─── NLP / Sentiment pipeline (aligned dengan notebook section 7) ─────────────
+
+def extract_sent_features(text: str) -> list:
+    """
+    Ekstrak 15 fitur linguistik + VADER untuk satu teks.
+    Identik dengan notebook cell 7.1 — digunakan oleh sent_lgbm.
+    """
+    t  = str(text)
+    tl = t.lower()
+    sc = ANALYZER.polarity_scores(t)
+    sents = [s.strip() for s in re.split(r"[.!?]+", t) if len(s.strip()) > 8]
+    ss    = [ANALYZER.polarity_scores(s)["compound"] for s in sents] if sents else [0.0]
+    return [
+        sc["compound"], sc["neg"], sc["pos"], sc["neu"],
+        min(ss),
+        float(np.mean(ss)),
+        float(np.std(ss)) if len(ss) > 1 else 0.0,
+        sum(1 for s in ss if s < -0.05) / max(len(ss), 1),
+        ss[-1],
+        sum(1 for kw in CHURN_INTENT_LEXICON if kw in tl),
+        sum(len(re.findall(p, tl)) for p in NEG_PATTERNS),
+        sum(1 for kw in POSITIVE_ANCHORS if kw in tl),
+        len(re.findall(CONTRAST_PATTERN, tl)),
+        len(t.split()),
+        t.count("!"),
+    ]
+
+
+def map_sentiment_tier(proba: float) -> str:
+    """4-tier label seperti notebook cell 7.4."""
+    if proba < 0.15:
+        return "Satisfied"
+    elif proba < 0.50:
+        return "Fairly Satisfied"
+    elif proba < 0.85:
+        return "Fairly Dissatisfied"
+    else:
+        return "Dissatisfied"
+
+
+def predict_sentiment(text: str) -> dict:
+    """
+    Prediksi sentimen satu teks menggunakan TF-IDF + LightGBM dari notebook.
+    Mengembalikan label 4-tier + dissatisfaction_score (0–1).
+    """
+    ling_feats   = np.array([extract_sent_features(text)])
+    X_tfidf      = TFIDF_SENT.transform([str(text)])
+    X_extra      = csr_matrix(SCALER_SENT.transform(ling_feats))
+    X_full       = hstack([X_tfidf, X_extra])
+    proba        = float(SENT_LGBM.predict_proba(X_full)[0, 1])
+    return {
+        "label":                map_sentiment_tier(proba),
+        "dissatisfaction_score": proba,
+    }
+
+
 def compute_vader_features(text: str) -> dict:
-    """Compute VADER + urgency features for a single customer text (v10 logic)."""
+    """
+    Hitung fitur VADER + urgency untuk satu teks pelanggan (digunakan pipeline utama).
+    Menyertakan dissatisfaction_proba dari model TF-IDF+LGBM (notebook section 7).
+    """
     empty = {k: 0.0 for k in [
         "vader_compound", "vader_pos", "vader_neg", "vader_neu",
         "vader_min_sent", "vader_std_sent", "pct_negative_sent",
         "urgency_score", "avg_words_per_sent",
+        "dissatisfaction_proba",
     ]}
     if not text or pd.isna(text):
         return empty
@@ -108,16 +186,20 @@ def compute_vader_features(text: str) -> dict:
     sents = [s.strip() for s in re.split(r"[.!?|]+", str(text)) if len(s.strip()) > 10]
     sc    = [ANALYZER.polarity_scores(s)["compound"] for s in sents] if sents else [0.0]
 
+    # Sentiment classifier (notebook section 7)
+    sent_result = predict_sentiment(text)
+
     return {
-        "vader_compound":    doc["compound"],
-        "vader_pos":         doc["pos"],
-        "vader_neg":         doc["neg"],
-        "vader_neu":         doc["neu"],
-        "vader_min_sent":    min(sc),
-        "vader_std_sent":    float(np.std(sc)),
-        "pct_negative_sent": sum(1 for s in sc if s < -0.05) / len(sc),
-        "urgency_score":     float(sum(1 for w in URGENCY_LEX if w in str(text).lower())),
-        "avg_words_per_sent": float(np.mean([len(s.split()) for s in sents])) if sents else 0.0,
+        "vader_compound":       doc["compound"],
+        "vader_pos":            doc["pos"],
+        "vader_neg":            doc["neg"],
+        "vader_neu":            doc["neu"],
+        "vader_min_sent":       min(sc),
+        "vader_std_sent":       float(np.std(sc)),
+        "pct_negative_sent":    sum(1 for s in sc if s < -0.05) / len(sc),
+        "urgency_score":        float(sum(1 for w in URGENCY_LEX if w in str(text).lower())),
+        "avg_words_per_sent":   float(np.mean([len(s.split()) for s in sents])) if sents else 0.0,
+        "dissatisfaction_proba": sent_result["dissatisfaction_score"],
     }
 
 
@@ -317,9 +399,8 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     master["urgency_level"]   = master["urgency_score"].apply(
         lambda u: "high" if u >= 3 else ("medium" if u >= 1 else "low")
     )
-    master["sentiment_label"] = master["vader_compound"].apply(
-        lambda c: "positive" if c >= 0.05 else ("negative" if c <= -0.05 else "neutral")
-    )
+    # sentiment_label 4-tier dari notebook section 7 (TF-IDF + LightGBM)
+    master["sentiment_label"] = master["dissatisfaction_proba"].apply(map_sentiment_tier)
 
     # ── Topic features (LDA) ──────────────────────────────────────────────────
     topic_feats = compute_topic_features(master["all_feedback"].tolist())
@@ -404,15 +485,16 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
 
             # ── NLP / Sentiment ────────────────────────────────────────────────
             "sentiment": {
-                "label":             row["sentiment_label"],
-                "vader_compound":    round(float(row["vader_compound"]), 4),
-                "vader_neg":         round(float(row["vader_neg"]), 4),
-                "pct_negative_sent": round(float(row["pct_negative_sent"]) * 100, 1),
-                "urgency_level":     row["urgency_level"],
-                "urgency_score":     int(row["urgency_score"]),
-                "dominant_topic":    row["dominant_topic_label"],
-                "topic_strength":    round(float(row["dominant_topic_score"]), 3),
-                "feedback_preview":  str(row["all_feedback"])[:300],
+                "label":                 row["sentiment_label"],
+                "dissatisfaction_score": round(float(row["dissatisfaction_proba"]), 4),
+                "vader_compound":        round(float(row["vader_compound"]), 4),
+                "vader_neg":             round(float(row["vader_neg"]), 4),
+                "pct_negative_sent":     round(float(row["pct_negative_sent"]) * 100, 1),
+                "urgency_level":         row["urgency_level"],
+                "urgency_score":         int(row["urgency_score"]),
+                "dominant_topic":        row["dominant_topic_label"],
+                "topic_strength":        round(float(row["dominant_topic_score"]), 3),
+                "feedback_preview":      str(row["all_feedback"])[:300],
             },
 
             # ── NLP flags (v10 new) ────────────────────────────────────────────
@@ -1788,4 +1870,3 @@ async def simulate(request: SimulateRequest):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
-
