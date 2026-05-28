@@ -41,8 +41,8 @@ sys.modules["__main__"].IdentityMapping = IdentityMapping
 # ─── Load artifacts ───────────────────────────────────────────────────────────
 print("Loading artifacts...")
 
-A = joblib.load(os.getenv("ARTIFACTS_PATH", "churn_artifacts_v2.pkl"))
-NLP = joblib.load(os.getenv("NLP_ARTIFACTS_PATH", "nlp_artifacts_v2.pkl"))
+A = joblib.load(os.getenv("ARTIFACTS_PATH", "arka_model_artifacts.pkl"))
+NLP = joblib.load(os.getenv("NLP_ARTIFACTS_PATH", "arka_nlp_artifacts.pkl"))
 
 # Notebook 1 (churn_artifacts_v2.pkl) — best model (no calibration wrapper in v2.1)
 MODEL        = A.get("calibrated_model") or A["model"]
