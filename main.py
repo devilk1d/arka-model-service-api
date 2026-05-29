@@ -670,7 +670,7 @@ SENTIMENT: {sent['label']} | VADER: {sent['vader_compound']:+.3f} | Urgency: {se
 Feedback: "{feedback_str[:400]}"
 
 Rules for your JSON values:
-- score_reason: 1-2 plain sentences. Use the actual numbers. Be specific about why this score.
+- score_reason: 1-5 plain sentences. Use the actual numbers. Be specific about why this score.
 - risk_factors: exactly 3 short phrases, max 8 words each, one per top SHAP driver.
 - feedback_signal: 1 plain sentence summarizing the customer complaint.
 - retain: exactly 3 short action items, max 12 words each, specific to this customer.
