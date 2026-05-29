@@ -241,16 +241,22 @@ def compute_topic_features(texts: list[str]) -> dict:
 
 def compute_nlp_flags(master: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute nlp_red_flag and loyalty_risk_flag exactly as in v10 notebook (Cell 91).
+    Compute nlp_red_flag and loyalty_risk_flag.
     Requires: vader_compound, urgency_score, churn_score, segment_label, tenure_days
+
+    loyalty_risk_flag: pelanggan dengan churn_score rendah (Low risk) tetapi berada di
+    segmen at-risk dengan tenure > 1 tahun — berpotensi under-estimated.
     """
     master = master.copy()
     master["nlp_red_flag"] = (
         (master["vader_compound"] < -0.2) & (master["urgency_score"] >= 1)
     ).astype(int)
+    # FIX: "Critical" bukan nama segment yang valid.
+    # Segment labels aktual: At-Risk Actives, Loyal Champions, High-Value At-Risk, Disengaged Payers
+    at_risk_segs = {"At-Risk Actives", "High-Value At-Risk", "Disengaged Payers"}
     master["loyalty_risk_flag"] = (
         (master["churn_score"] <= RISK_LOW) &
-        (master["segment_label"] == "Critical") &
+        (master["segment_label"].isin(at_risk_segs)) &
         (master["tenure_days"] > 365)
     ).astype(int)
     return master
@@ -259,26 +265,36 @@ def compute_nlp_flags(master: pd.DataFrame) -> pd.DataFrame:
 # ─── Core pipeline ─────────────────────────────────────────────────────────────
 def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     """
-    Full pipeline aligned with notebook_1 (churn_artifacts_v2.pkl) and
-    notebook_2 (nlp_artifacts_v2.pkl).
+    Full pipeline — setiap langkah selaras 1-to-1 dengan notebook_1 (section 2-8)
+    dan notebook_2 (section 7 untuk sentimen).
 
-    Key facts vs legacy version:
-      - MODEL      = best raw model (LightGBM/XGBoost/GBM) — no calibration wrapper
-      - iso_reg    = IdentityMapping (passthrough); raw probabilities are used directly
-      - SEG_ACTIONS keyed by segment label (not by plan_type)
-      - CV_VEC / LDA / TOPIC_NAMES / URGENCY_LEX / N_TOPICS loaded from NLP artifact
-      - PRODUCTION_FEATURES comes from A["production_features"]
-      - tenure_capped (<=365) used for dunning_per_tenure interaction feature
-      - ticket_per_revenue uses log_total_revenue (+1e-3) denominator
-      - nps_x_dunning multiplied by has_nps_data mask
-      - SEG_FEATURES uses log_revenue / log_usage (pre-computed)
+    Perbaikan vs versi lama:
+      (1) plan_type  : str.capitalize().str.strip()  (bukan .title())
+      (2) contract_type: str.strip() saja, tanpa ubah case (notebook 2.1)
+      (3) obs_date filter: bd/st/nps/um difilter ke record sebelum obs_date (notebook 2.6)
+      (4) days_since_login: .clip(lower=0) ditambahkan (notebook 4.2)
+      (5) Blanket fillna(0) dihapus — hanya kolom tertentu yang di-zero-fill (notebook 4.5)
+      (6) dunning_per_tenure: tenure_days bukan tenure_capped (notebook 4.6)
+      (7) ticket_per_revenue: total_tickets/(total_revenue.replace(0,1)/1000) (notebook 4.6)
+      (8) nps_x_dunning: fillna(5) bukan fillna(0), tanpa has_nps_data multiplier (notebook 4.6)
+      (9) NPS imputation: global median SEBELUM segmentasi (notebook 4.8)
+      (10) Model input: master[FEATURES].fillna(0) tepat sebelum predict (notebook 6.1)
     """
-    # ── Clean ──────────────────────────────────────────────────────────────────
+    # ── 1. Clean (notebook section 2.1-2.5) ────────────────────────────────────
     ca_df  = ca_df.copy()
-    ca_df["plan_type"]     = ca_df["plan_type"].str.lower().str.strip().str.title()
-    ca_df["contract_type"] = ca_df["contract_type"].str.lower().str.strip().str.title()
-    nps_df["nps_score"]    = nps_df["nps_score"].clip(lower=0)
+    bd_df  = bd_df.copy()
+    um_df  = um_df.copy()
+    st_df  = st_df.copy()
+    nps_df = nps_df.copy()
 
+    # FIX (1): capitalize (bukan title) sesuai notebook cell 2.1
+    ca_df["plan_type"]     = ca_df["plan_type"].str.capitalize().str.strip()
+    # FIX (2): contract_type hanya di-strip, tanpa ubah case
+    ca_df["contract_type"] = ca_df["contract_type"].str.strip()
+    # clip NPS 0-10 (notebook 2.5)
+    nps_df["nps_score"]    = nps_df["nps_score"].clip(lower=0, upper=10)
+
+    # Parse dates
     for df, cols in [
         (ca_df,  ["subscription_date", "unsubscribed_date"]),
         (bd_df,  ["billing_date", "payment_date"]),
@@ -290,12 +306,31 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
             if c in df.columns:
                 df[c] = pd.to_datetime(df[c], errors="coerce")
 
-    ca_df["tenure_days"]   = (
-        ca_df["unsubscribed_date"].fillna(REF) - ca_df["subscription_date"]
-    ).dt.days.clip(lower=1)
-    ca_df["tenure_capped"] = ca_df["tenure_days"].clip(upper=365)  # v10: capped tenure for interaction
+    # obs_date: unsubscribed_date untuk yang churn, REFERENCE_DATE untuk active (notebook 2.2)
+    ca_df["obs_date"] = ca_df["unsubscribed_date"].fillna(REF)
 
-    # ── Billing features ───────────────────────────────────────────────────────
+    # Hapus record dengan tenure negatif (notebook 2.3)
+    ca_df["_tenure_raw"] = (ca_df["obs_date"] - ca_df["subscription_date"]).dt.days
+    ca_df = ca_df[ca_df["_tenure_raw"] >= 0].drop(columns="_tenure_raw").reset_index(drop=True)
+
+    # Deduplicate billing (notebook 2.4)
+    bd_df = bd_df.drop_duplicates().reset_index(drop=True)
+
+    # ── 2. FIX (3): Filter record pasca-obs_date (notebook section 2.6) ────────
+    bd_df  = (bd_df.merge(ca_df[["customer_id", "obs_date"]], on="customer_id")
+                   .query("payment_date  <= obs_date")
+                   .drop(columns="obs_date").reset_index(drop=True))
+    st_df  = (st_df.merge(ca_df[["customer_id", "obs_date"]], on="customer_id")
+                   .query("created_date  <= obs_date")
+                   .drop(columns="obs_date").reset_index(drop=True))
+    nps_df = (nps_df.merge(ca_df[["customer_id", "obs_date"]], on="customer_id")
+                    .query("survey_date  <= obs_date")
+                    .drop(columns="obs_date").reset_index(drop=True))
+    um_df  = (um_df.merge(ca_df[["customer_id", "obs_date"]], on="customer_id")
+                   .query("last_login_date <= obs_date")
+                   .drop(columns="obs_date").reset_index(drop=True))
+
+    # ── 3. Billing features (notebook section 4.1) ─────────────────────────────
     payments = bd_df[bd_df["record_type"] == "payment"].copy()
     payments["delay_days"] = (payments["payment_date"] - payments["billing_date"]).dt.days
     bf = payments.groupby("customer_id").agg(
@@ -311,12 +346,16 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     bf  = bf.merge(dun, on="customer_id", how="left")
     bf["dunning_count"] = bf["dunning_count"].fillna(0)
 
-    # ── Usage features ─────────────────────────────────────────────────────────
+    # ── 4. Usage features (notebook section 4.2) ───────────────────────────────
+    # Re-merge obs_date karena sudah di-drop saat filter
     uf = um_df.copy()
-    uf["days_since_login"] = (REF - uf["last_login_date"]).dt.days
-    uf = uf.drop(columns=["last_login_date"], errors="ignore")
+    uf = uf.merge(ca_df[["customer_id", "obs_date"]], on="customer_id", how="left")
+    # LEAKAGE FIX: days_since_login selalu pakai REFERENCE_DATE, bukan obs_date
+    # FIX (4): tambahkan .clip(lower=0)
+    uf["days_since_login"] = (REF - uf["last_login_date"]).dt.days.clip(lower=0)
+    uf = uf.drop(columns=["last_login_date", "obs_date"], errors="ignore")
 
-    # ── Ticket features ────────────────────────────────────────────────────────
+    # ── 5. Ticket features (notebook section 4.3) ──────────────────────────────
     tf = st_df.groupby("customer_id").agg(
         total_tickets     =("ticket_id",  "count"),
         open_tickets      =("status",     lambda x: (x == "Open").sum()),
@@ -328,7 +367,7 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     tf["unresolved_ratio"] = tf["open_tickets"]     / tf["total_tickets"].replace(0, 1)
     tf["critical_ratio"]   = tf["critical_tickets"] / tf["total_tickets"].replace(0, 1)
 
-    # ── NPS tabular features ───────────────────────────────────────────────────
+    # ── 6. NPS tabular features (notebook section 4.4) ─────────────────────────
     nf = nps_df.groupby("customer_id").agg(
         avg_nps_score =("nps_score", "mean"),
         min_nps_score =("nps_score", "min"),
@@ -337,84 +376,86 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     ).reset_index()
     nf["has_nps_data"] = 1
 
-    # ── NPS text: per-customer aggregated feedback ─────────────────────────────
+    # ── 7. NPS text: feedback agregasi per customer ─────────────────────────────
     text_per = (nps_df.groupby("customer_id")["feedback_text"]
                 .apply(lambda x: " | ".join(x.dropna().astype(str)))
                 .reset_index())
     text_per.columns = ["customer_id", "all_feedback"]
 
-    # ── Master merge ───────────────────────────────────────────────────────────
+    # ── 8. Master merge (notebook section 4.5) ─────────────────────────────────
     master = ca_df[["customer_id", "plan_type", "contract_type", "total_users",
-                     "tenure_days", "tenure_capped"]].copy()
+                     "subscription_date", "obs_date"]].copy()
+    master["tenure_days"] = (
+        master["obs_date"] - master["subscription_date"]
+    ).dt.days.clip(lower=1)
+
     master = (master
               .merge(uf, on="customer_id", how="left")
               .merge(bf, on="customer_id", how="left")
               .merge(tf, on="customer_id", how="left")
               .merge(nf, on="customer_id", how="left"))
 
-    # ── Fillna(0) semua kolom numerik sebelum pipeline lanjut ───────────────────
-    # Ini mencegah KeyError/NaN error jika sub-table (billing/usage/ticket) kosong
-    # setelah left-merge — kolom tetap ada tapi NaN, bukan missing sama sekali.
-    # Khusus kolom string/text tidak tersentuh karena select_dtypes(include=number).
-    _numeric_cols = master.select_dtypes(include=[np.number]).columns
-    master[_numeric_cols] = master[_numeric_cols].fillna(0)
+    # FIX (5): zero-fill HANYA kolom yang harus 0 (sesuai notebook 4.5).
+    # JANGAN zero-fill total_revenue / avg_payment_value / payment_count —
+    # biarkan NaN agar ticket_per_revenue dan log features tidak rusak.
+    fill_zero = ["total_tickets", "open_tickets", "billing_tickets", "technical_tickets",
+                 "critical_tickets", "high_tickets", "unresolved_ratio", "critical_ratio",
+                 "dunning_count", "avg_payment_delay", "max_payment_delay"]
+    master[fill_zero]      = master[fill_zero].fillna(0)
+    master["has_nps_data"] = master["has_nps_data"].fillna(0)
 
-    # ── Segmentation (before imputation, using log_revenue/log_usage) ──────────
-    master["log_revenue"] = np.log1p(master["total_revenue"].fillna(0))
-    master["log_usage"]   = np.log1p(master["monthly_usage_hrs"].fillna(0))
+    # ── 9. Interaction & ratio features (notebook section 4.6) ─────────────────
+    master["log_total_revenue"]     = np.log1p(master["total_revenue"])
+    master["log_monthly_usage_hrs"] = np.log1p(master["monthly_usage_hrs"])
+    master["log_total_tickets"]     = np.log1p(master["total_tickets"])
+    master["log_total_users"]       = np.log1p(master["total_users"])
 
-    seg_raw = master[SEG_FEATURES].copy()   # ['days_since_login','payment_count','log_revenue','log_usage','feature_adoption_pct','avg_nps_score']
-    for c in SEG_FEATURES:
-        seg_raw[c] = seg_raw[c].fillna(seg_raw[c].median())
-    X_seg = SCALER_SEG.transform(seg_raw.values)
-    master["segment_cluster"] = KMEANS.predict(X_seg)
-    master["segment_label"]   = master["segment_cluster"].map(LABEL_MAP)
+    # FIX (6): gunakan tenure_days (bukan tenure_capped) sesuai notebook 4.6
+    master["dunning_per_tenure"] = (
+        master["dunning_count"] /
+        (master["tenure_days"] / 30).replace(0, 1)
+    )
+    master["usage_per_user"] = (
+        master["monthly_usage_hrs"] / master["total_users"].replace(0, 1)
+    )
+    # FIX (7): denominator = total_revenue / 1000 (bukan log_total_revenue + 1e-3)
+    # Ini mempertahankan unit "tiket per $1000 revenue" sesuai notebook
+    master["ticket_per_revenue"] = (
+        master["total_tickets"] / (master["total_revenue"].replace(0, 1) / 1000)
+    )
+    master["adoption_x_usage"] = (
+        master["feature_adoption_pct"] * master["log_monthly_usage_hrs"]
+    )
+    # FIX (8): fillna(5) bukan fillna(0), tanpa perkalian has_nps_data
+    master["nps_x_dunning"] = (
+        master["avg_nps_score"].fillna(5) * (master["dunning_count"] + 1)
+    )
 
-    # ── NPS imputation (cluster-median) ────────────────────────────────────────
-    for col in ["avg_nps_score", "min_nps_score", "survey_count", "pct_detractor"]:
-        med = master.groupby("segment_cluster")[col].transform("median")
-        master[col] = master[col].fillna(med).fillna(master[col].median())
-    master["has_nps_data"] = master["has_nps_data"].fillna(0).astype(int)
-
-    # ── Zero-fill ticket / payment delay ───────────────────────────────────────
-    for col in ["total_tickets", "open_tickets", "billing_tickets", "technical_tickets",
-                "critical_tickets", "high_tickets", "unresolved_ratio", "critical_ratio",
-                "avg_payment_delay", "max_payment_delay"]:
-        master[col] = master[col].fillna(0)
-
-    # ── Encodings ─────────────────────────────────────────────────────────────
+    # ── 10. Encoding & NPS imputation (notebook section 4.8) ───────────────────
+    # FIX (9): NPS diimputasi dengan global median SEBELUM segmentasi
     master["plan_enc"]     = LE_PLAN.transform(master["plan_type"])
     master["contract_enc"] = LE_CONTRACT.transform(master["contract_type"])
 
-    # ── Log transforms (fillna before log to avoid NaN propagation) ─────────────
-    for col in ["total_users", "monthly_usage_hrs", "total_revenue", "total_tickets"]:
-        master[f"log_{col}"] = np.log1p(master[col].fillna(0))
+    for col in ["avg_nps_score", "min_nps_score", "survey_count", "pct_detractor"]:
+        med = master[col].median()
+        master[col] = master[col].fillna(med)
 
-    # ── Interaction features (v10: tenure_capped, log denom, has_nps_data mask) ─
-    master["dunning_per_tenure"] = (
-        master["dunning_count"].fillna(0) /
-        np.where(master["tenure_capped"].fillna(1) / 30 == 0, 1, master["tenure_capped"].fillna(1) / 30)
-    )
-    master["usage_per_user"] = (
-        master["monthly_usage_hrs"].fillna(0) /
-        np.where(master["total_users"].fillna(1) == 0, 1, master["total_users"].fillna(1))
-    )
-    master["ticket_per_revenue"] = (
-        master["total_tickets"].fillna(0) / (master["log_total_revenue"].fillna(0) + 1e-3)
-    )
-    master["adoption_x_usage"] = (
-        master["feature_adoption_pct"].fillna(0) * master["log_monthly_usage_hrs"].fillna(0)
-    )
-    master["nps_x_dunning"] = (
-        master["avg_nps_score"].fillna(0) *
-        (master["dunning_count"].fillna(0) + 1) *
-        master["has_nps_data"].fillna(0)
-    )
+    # ── 11. Segmentation (notebook section 5) ──────────────────────────────────
+    # SEG_FEATURES dari artifact = ['monthly_usage_hrs','feature_adoption_pct',
+    #                                'total_revenue','payment_count','avg_nps_score']
+    # SCALER_SEG di-fit pada raw values tersebut (bukan log)
+    seg_data = master[SEG_FEATURES].copy()
+    for c in SEG_FEATURES:
+        seg_data[c] = seg_data[c].fillna(seg_data[c].median())
+    X_seg = SCALER_SEG.transform(seg_data.values)
+    master["segment_cluster"] = KMEANS.predict(X_seg)
+    master["segment_label"]   = master["segment_cluster"].map(LABEL_MAP)
 
-    # ── VADER / NLP features (v10: per-customer, merged back) ─────────────────
+    # ── 12. Merge NPS text feedback ────────────────────────────────────────────
     master = master.merge(text_per, on="customer_id", how="left")
     master["all_feedback"] = master["all_feedback"].fillna("")
 
+    # ── 13. VADER / NLP features ───────────────────────────────────────────────
     vader_rows = master["all_feedback"].apply(compute_vader_features)
     vader_df   = pd.DataFrame(list(vader_rows))
     for col in vader_df.columns:
@@ -423,39 +464,39 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     master["urgency_level"]   = master["urgency_score"].apply(
         lambda u: "high" if u >= 3 else ("medium" if u >= 1 else "low")
     )
-    # sentiment_label 4-tier dari notebook section 7 (TF-IDF + LightGBM)
     master["sentiment_label"] = master["dissatisfaction_proba"].apply(map_sentiment_tier)
 
-    # ── Topic features (LDA) ──────────────────────────────────────────────────
+    # ── 14. Topic features (LDA dari notebook 2) ───────────────────────────────
     topic_feats = compute_topic_features(master["all_feedback"].tolist())
     master["dominant_topic_label"] = topic_feats["dominant_topic_label"]
     master["dominant_topic_score"] = topic_feats["dominant_topic_score"]
-    X_topics = topic_feats["topic_distribution"]
 
-    # ── Model prediction (calibrated model → better probabilities) ────────────
-    X_tab     = master[FEATURES].values
+    # ── 15. Model prediction ───────────────────────────────────────────────────
+    # FIX (10): fillna(0) tepat sebelum predict, sesuai notebook:
+    #           X = master[PRODUCTION_FEATURES].fillna(0).values
+    X_tab     = master[FEATURES].fillna(0).values
     tab_proba = MODEL.predict_proba(X_tab)[:, 1]
 
-    # ── SHAP (v10: uses the stored explainer which wraps the base estimator) ───
-    shap_vals = EXPLAINER.shap_values(master[FEATURES])
+    # ── 16. SHAP ───────────────────────────────────────────────────────────────
+    shap_vals = EXPLAINER.shap_values(master[FEATURES].fillna(0))
     if isinstance(shap_vals, list):
         shap_vals = shap_vals[1]
     shap_df = pd.DataFrame(shap_vals, columns=FEATURES)
 
-    # ── Score & risk ──────────────────────────────────────────────────────────
-    churn_score = (tab_proba * 100).round(1)          # numpy ndarray
+    # ── 17. Score & risk ───────────────────────────────────────────────────────
+    churn_score = (tab_proba * 100).round(1)
     master["churn_proba"] = tab_proba.round(4)
     master["churn_score"] = churn_score
-    master["risk_level"]  = [risk_level(s) for s in churn_score]  # list comprehension, not .apply()
+    master["risk_level"]  = [risk_level(s) for s in churn_score]
 
-    # ── NLP flags (v10: Cell 91) ───────────────────────────────────────────────
+    # ── 18. NLP flags ──────────────────────────────────────────────────────────
     master = compute_nlp_flags(master)
 
-    # ── Segment centroid RFM context ──────────────────────────────────────────
+    # ── 19. Segment centroid RFM context ───────────────────────────────────────
     centroids_raw = SCALER_SEG.inverse_transform(KMEANS.cluster_centers_)
     centroid_df   = pd.DataFrame(centroids_raw, columns=SEG_FEATURES)
 
-    # ── Build output ──────────────────────────────────────────────────────────
+    # ── 20. Build output ───────────────────────────────────────────────────────
     results = []
     for i in range(len(master)):
         row      = master.iloc[i]
@@ -464,7 +505,7 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
         seg_prof = next((p for p in SEG_PROFILES if p["segment_label"] == seg), {})
         centroid = centroid_df.iloc[seg_cl].to_dict()
 
-        # Segment actions — keyed by segment label in notebook 1's SEG_ACTIONS artifact
+        # Segment actions — keyed by segment label
         seg_action_data = SEG_ACTIONS.get(seg, {})
         seg_act = {
             "description": seg_action_data.get("description", ""),
@@ -473,22 +514,21 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
             "priority":    seg_action_data.get("priority", row["risk_level"]),
         }
 
-        # centroid keys = SEG_FEATURES = ['days_since_login','payment_count',
-        # 'log_revenue','log_usage','feature_adoption_pct','avg_nps_score']
-        # total_revenue & monthly_usage_hrs exist in master row but NOT in centroid
+        # centroid keys = SEG_FEATURES = ['monthly_usage_hrs','feature_adoption_pct',
+        #                                  'total_revenue','payment_count','avg_nps_score']
         seg_rfm_context = {
-            "days_since_login":      {"customer": round(float(row.get("days_since_login", 0)), 1),
-                                      "segment_avg": round(float(centroid.get("days_since_login", 0)), 1)},
-            "payment_count":         {"customer": round(float(row.get("payment_count", 0)), 1),
-                                      "segment_avg": round(float(centroid.get("payment_count", 0)), 1)},
-            "total_revenue":         {"customer": round(float(row.get("total_revenue", 0)), 1),
-                                      "segment_avg": round(float(np.expm1(centroid.get("log_revenue", 0))), 1)},
-            "monthly_usage_hrs":     {"customer": round(float(row.get("monthly_usage_hrs", 0)), 1),
-                                      "segment_avg": round(float(np.expm1(centroid.get("log_usage", 0))), 1)},
-            "feature_adoption_pct":  {"customer": round(float(row.get("feature_adoption_pct", 0)), 1),
-                                      "segment_avg": round(float(centroid.get("feature_adoption_pct", 0)), 1)},
-            "avg_nps_score":         {"customer": round(float(row.get("avg_nps_score", 0)), 2),
-                                      "segment_avg": round(float(centroid.get("avg_nps_score", 0)), 2)},
+            "days_since_login":     {"customer": round(float(row.get("days_since_login", 0)), 1),
+                                     "segment_avg": 0.0},
+            "payment_count":        {"customer": round(float(row.get("payment_count", 0)), 1),
+                                     "segment_avg": round(float(centroid.get("payment_count", 0)), 1)},
+            "total_revenue":        {"customer": round(float(row.get("total_revenue", 0) if pd.notna(row.get("total_revenue")) else 0), 1),
+                                     "segment_avg": round(float(centroid.get("total_revenue", 0)), 1)},
+            "monthly_usage_hrs":    {"customer": round(float(row.get("monthly_usage_hrs", 0) if pd.notna(row.get("monthly_usage_hrs")) else 0), 1),
+                                     "segment_avg": round(float(centroid.get("monthly_usage_hrs", 0)), 1)},
+            "feature_adoption_pct": {"customer": round(float(row.get("feature_adoption_pct", 0) if pd.notna(row.get("feature_adoption_pct")) else 0), 1),
+                                     "segment_avg": round(float(centroid.get("feature_adoption_pct", 0)), 1)},
+            "avg_nps_score":        {"customer": round(float(row.get("avg_nps_score", 0)), 2),
+                                     "segment_avg": round(float(centroid.get("avg_nps_score", 0)), 2)},
         }
 
         results.append({
@@ -497,17 +537,17 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
             "plan_type":            row["plan_type"],
             "contract_type":        row["contract_type"],
 
-            # ── Churn Score ────────────────────────────────────────────────────
+            # ── Churn Score ───────────────────────────────────────────────────
             "churn_score":          float(row["churn_score"]),
             "churn_proba":          round(float(tab_proba[i]), 4),
             "tabular_proba":        round(float(tab_proba[i]), 4),
-            "nlp_proba":            round(float(tab_proba[i]), 4),  # v10: single model, no NLP fusion
+            "nlp_proba":            round(float(tab_proba[i]), 4),
             "risk_level":           row["risk_level"],
 
-            # ── SHAP (tabular) ─────────────────────────────────────────────────
+            # ── SHAP (tabular) ────────────────────────────────────────────────
             "shap_top5":            get_top_shap(shap_df.iloc[i]),
 
-            # ── NLP / Sentiment ────────────────────────────────────────────────
+            # ── NLP / Sentiment ───────────────────────────────────────────────
             "sentiment": {
                 "label":                 row["sentiment_label"],
                 "dissatisfaction_score": round(float(row["dissatisfaction_proba"]), 4),
@@ -521,12 +561,12 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
                 "feedback_preview":      str(row["all_feedback"])[:300],
             },
 
-            # ── NLP flags (v10 new) ────────────────────────────────────────────
+            # ── NLP flags ─────────────────────────────────────────────────────
             "nlp_red_flag":         int(row["nlp_red_flag"]),
             "loyalty_risk_flag":    int(row["loyalty_risk_flag"]),
             "has_nps_data":         int(row["has_nps_data"]),
 
-            # ── Segmentation ───────────────────────────────────────────────────
+            # ── Segmentation ──────────────────────────────────────────────────
             "segment_label":        seg,
             "segment_cluster":      seg_cl,
             "segment_rfm_context":  seg_rfm_context,
