@@ -112,6 +112,26 @@ def risk_level(score: float) -> str:
     return "Low" if score <= RISK_LOW else ("Medium" if score <= RISK_HIGH else "High")
 
 
+def sanitize_floats(obj):
+    """
+    Recursively replace NaN/Inf/-Inf with JSON-safe values.
+    JSON spec does not allow these float values, causing a ValueError on serialize.
+    """
+    if isinstance(obj, float):
+        if obj != obj:          # NaN
+            return None
+        if obj == float("inf"):
+            return None
+        if obj == float("-inf"):
+            return None
+        return obj
+    if isinstance(obj, dict):
+        return {k: sanitize_floats(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [sanitize_floats(v) for v in obj]
+    return obj
+
+
 def get_top_shap(shap_row: pd.Series, top_n: int = 5) -> list:
     top = shap_row.abs().nlargest(top_n)
     return [
@@ -814,7 +834,7 @@ async def generate_cohort_xai(segments: list[SegmentCohortRequest]):
             total_customers = seg.total_all_customers or total,
         )
         results[seg.segment_label] = await _call_llm_xai(prompt)
-    return {"status": "success", "cohort_xai": results}
+    return sanitize_floats({"status": "success", "cohort_xai": results})
 
 
 @app.get("/health")
@@ -902,7 +922,7 @@ async def predict(
             r["xai_segment_explanation"] = None
             r["xai_segment_cohort"]      = None
 
-    return {"status": "success", "total_customers": len(results), "predictions": results}
+    return sanitize_floats({"status": "success", "total_customers": len(results), "predictions": results})
 
 
 @app.post("/predict/single")
@@ -945,7 +965,7 @@ async def predict_single(
             total_customers = 1,
         )
     )
-    return r
+    return sanitize_floats(r)
 
 
 # ─── Simulation: Churn Trajectory ────────────────────────────────────────────
