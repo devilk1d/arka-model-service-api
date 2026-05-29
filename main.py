@@ -348,13 +348,43 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     master["plan_enc"]     = LE_PLAN.transform(master["plan_type"])
     master["contract_enc"] = LE_CONTRACT.transform(master["contract_type"])
 
+    DEFAULT_IMPUTE = {
+        "avg_nps_score":        7.0,
+        "min_nps_score":        7.0,
+        "survey_count":         0.0,
+        "pct_detractor":        0.0,
+        "total_revenue":        0.0,
+        "payment_count":        0.0,
+        "monthly_usage_hrs":    0.0,
+        "feature_adoption_pct": 0.0,
+        "days_since_login":     0.0,
+        "tenure_days":          30.0,
+        "total_tickets":        0.0,
+        "open_tickets":         0.0,
+        "billing_tickets":      0.0,
+        "technical_tickets":    0.0,
+        "critical_tickets":     0.0,
+        "high_tickets":         0.0,
+        "unresolved_ratio":     0.0,
+        "critical_ratio":       0.0,
+        "dunning_count":        0.0,
+        "avg_payment_delay":    0.0,
+        "max_payment_delay":    0.0,
+        "total_users":          1.0,
+    }
+
     for col in ["avg_nps_score", "min_nps_score", "survey_count", "pct_detractor"]:
         med = master[col].median()
+        if pd.isna(med):
+            med = DEFAULT_IMPUTE.get(col, 7.0)
         master[col] = master[col].fillna(med)
 
     seg_data = master[SEG_FEATURES].copy()
     for c in SEG_FEATURES:
-        seg_data[c] = seg_data[c].fillna(seg_data[c].median())
+        med = seg_data[c].median()
+        if pd.isna(med):
+            med = DEFAULT_IMPUTE.get(c, 0.0)
+        seg_data[c] = seg_data[c].fillna(med)
     X_seg = SCALER_SEG.transform(seg_data.values)
     master["segment_cluster"] = KMEANS.predict(X_seg)
     master["segment_label"]   = master["segment_cluster"].map(LABEL_MAP)
