@@ -670,7 +670,7 @@ SENTIMENT: {sent['label']} | VADER: {sent['vader_compound']:+.3f} | Urgency: {se
 Feedback: "{feedback_str[:400]}"
 
 Rules for your JSON values:
-- score_reason: 1-5 plain sentences. Use the actual numbers. Be specific about why this score.
+- score_reason: Write 3–6 clear and meaningful sentences explaining why this score was given. Use the actual numerical values, metrics, or indicators in the explanation. Highlight the most important contributing factors, describe their impact briefly, and make the reasoning specific, insightful, and easy to understand. Avoid generic statements or repetition.
 - risk_factors: exactly 3 short phrases, max 8 words each, one per top SHAP driver.
 - feedback_signal: 1 plain sentence summarizing the customer complaint.
 - retain: exactly 3 short action items, max 12 words each, specific to this customer.
@@ -1367,31 +1367,56 @@ async def simulate(request: SimulateRequest):
         return result
 
     async def _run_agents_parallel(agent_ctx: str, agent_systems: dict[str, str]):
-        """Run all 4 agents concurrently; stream results once collected."""
+        """Run all 4 agents concurrently; stream tokens and done status in real-time using an asyncio.Queue."""
+        queue = asyncio.Queue()
+        active_tasks = 0
 
-        async def _collect_one(persona: dict) -> tuple[dict, str]:
-            name    = persona["name"]
-            system  = agent_systems.get(name, "You are a customer success expert. Give a brief analysis.")
-            content = ""
-            async for tok in stream_llm_no_think(system, agent_ctx, max_tokens=450):
-                content += tok
-            return persona, _strip_markdown(content)
-
-        # Launch all 4 in parallel
-        gathered = await asyncio.gather(*[_collect_one(p) for p in AGENT_PERSONAS])
-
-        outputs: list[dict] = []
-        for persona, content in gathered:
+        async def _run_one(persona: dict):
             name = persona["name"]
-            yield f"data: {json.dumps({'type': 'agent_start', 'agent': name, 'short': persona['short'], 'color': persona['color']})}\n\n"
-            # Emit content in small chunks so the frontend can render progressively
-            chunk = 100
-            for i in range(0, max(len(content), 1), chunk):
-                yield f"data: {json.dumps({'type': 'agent_token', 'agent': name, 'content': content[i:i+chunk]})}\n\n"
-            yield f"data: {json.dumps({'type': 'agent_done', 'agent': name})}\n\n"
-            outputs.append({"name": name, "content": content})
+            system = agent_systems.get(name, "You are a customer success expert. Give a brief analysis.")
+            try:
+                # 1. Put agent_start event into the queue
+                await queue.put({"type": "agent_start", "agent": name, "short": persona["short"], "color": persona["color"]})
+                
+                content = ""
+                # 2. Stream tokens into the queue
+                async for tok in stream_llm_no_think(system, agent_ctx, max_tokens=450):
+                    content += tok
+                    await queue.put({"type": "agent_token", "agent": name, "content": tok})
+                
+                # 3. Put agent_done event into the queue
+                await queue.put({"type": "agent_done", "agent": name, "content": _strip_markdown(content)})
+            except Exception as e:
+                # If an error happens, still mark agent as done or log
+                await queue.put({"type": "agent_done", "agent": name, "content": f"Analysis unavailable: {str(e)}"})
 
-        _run_agents_parallel._last_outputs = outputs  # type: ignore[attr-defined]
+        # Start all tasks
+        for p in AGENT_PERSONAS:
+            asyncio.create_task(_run_one(p))
+            active_tasks += 1
+
+        outputs: dict[str, str] = {p["name"]: "" for p in AGENT_PERSONAS}
+        completed_agents = 0
+
+        # Read from queue and yield events
+        while completed_agents < active_tasks:
+            evt = await queue.get()
+            if evt["type"] == "agent_start":
+                yield f"data: {json.dumps({'type': 'agent_start', 'agent': evt['agent'], 'short': evt['short'], 'color': evt['color']})}\n\n"
+            elif evt["type"] == "agent_token":
+                outputs[evt["agent"]] += evt["content"]
+                yield f"data: {json.dumps({'type': 'agent_token', 'agent': evt['agent'], 'content': evt['content']})}\n\n"
+            elif evt["type"] == "agent_done":
+                # Ensure the content is stripped and saved
+                outputs[evt["agent"]] = _strip_markdown(outputs[evt["agent"]])
+                yield f"data: {json.dumps({'type': 'agent_done', 'agent': evt['agent']})}\n\n"
+                completed_agents += 1
+            queue.task_done()
+
+        # Save the outputs back for the recommendations and narrative
+        _run_agents_parallel._last_outputs = [
+            {"name": name, "content": content} for name, content in outputs.items()
+        ]
 
     async def event_stream():
 
