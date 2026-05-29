@@ -23,28 +23,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── IdentityMapping ──────────────────────────────────────────────────────────
-# Notebook 1 (v2.1) replaces isotonic calibration with this passthrough wrapper
-# and saves it as `iso_reg` inside churn_artifacts_v2.pkl.
-# Pickle serialises it as `__main__.IdentityMapping`, so we must:
-#   1. define the class here, and
-#   2. register it in sys.modules['__main__'] BEFORE joblib.load() is called.
-# Without step 2, uvicorn's own __main__ (the binary) won't have the class and
-# deserialization raises AttributeError.
 class IdentityMapping:
-    """Passthrough calibrator — returns raw probabilities unchanged."""
     def predict(self, x):
         return x
 
 sys.modules["__main__"].IdentityMapping = IdentityMapping
 
-# ─── Load artifacts ───────────────────────────────────────────────────────────
+# Load artifacts
 print("Loading artifacts...")
 
-A = joblib.load(os.getenv("ARTIFACTS_PATH", "arka_model_artifacts.pkl"))
-NLP = joblib.load(os.getenv("NLP_ARTIFACTS_PATH", "arka_nlp_artifacts.pkl"))
+A = joblib.load(os.getenv("ARTIFACTS_PATH", "arka_model_artifacts_v2.pkl"))
+NLP = joblib.load(os.getenv("NLP_ARTIFACTS_PATH", "arka_nlp_artifacts_v2.pkl"))
 
-# Notebook 1 (churn_artifacts_v2.pkl) — best model (no calibration wrapper in v2.1)
+# Notebook model
 MODEL        = A.get("calibrated_model") or A["model"]
 FEATURES     = A["production_features"]
 LE_PLAN      = A["le_plan"]
@@ -59,14 +50,14 @@ RISK_LOW     = A["risk_thresholds"]["low"]
 RISK_HIGH    = A["risk_thresholds"]["high"]
 REF          = pd.Timestamp(A["reference_date"])
 
-# Notebook 2 (nlp_artifacts_v2.pkl) — LDA / topic / urgency artefacts live here, NOT in churn pkl
+# Notebook NLP
 CV_VEC      = NLP["cv_vec"]
 LDA         = NLP["lda"]
 TOPIC_NAMES = NLP["topic_names"]
 URGENCY_LEX = NLP["urgency_lexicon"]
 N_TOPICS    = NLP["n_topics"]
 
-# ─── NLP Sentiment artifacts (dari nlp_artifacts_v2.pkl / notebook section 7) ─
+# NLP Sentiment artifacts (Section 7)
 TFIDF_SENT           = NLP["tfidf_sent"]
 SENT_LGBM            = NLP["sent_lgbm"]
 SCALER_SENT          = NLP["scaler_sent"]
@@ -82,8 +73,7 @@ POSITIVE_ANCHORS = [
 ]
 CONTRAST_PATTERN = r"\b(but|however|although|yet|despite|while|though|even though|nevertheless)\b"
 
-# SHAP explainer — v10 stores it directly in the artifact bundle
-# For CalibratedClassifierCV we need the underlying base estimator
+# SHAP explainer
 EXPLAINER = A.get("explainer")
 if EXPLAINER is None:
     _base = MODEL.calibrated_classifiers_[0].estimator if hasattr(MODEL, "calibrated_classifiers_") else MODEL
@@ -94,7 +84,7 @@ ANALYZER = SentimentIntensityAnalyzer()
 LLM_URL   = os.getenv("OLLAMA_URL",      "https://api.ollama.ai/v1")
 LLM_KEY   = os.getenv("OLLAMA_API_KEY",  "")
 LLM_MODEL = os.getenv("OLLAMA_MODEL",    "qwen3.5:397b-cloud")
-FUSION_ALPHA = float(os.getenv("FUSION_ALPHA", "1.0"))  # v10: single calibrated model, no NLP fusion
+FUSION_ALPHA = float(os.getenv("FUSION_ALPHA", "1.0"))
 
 print("✅ Artifacts loaded (v2.1 — best model active)")
 print(f"   model_version : {A.get('model_version', 'unknown')}")
@@ -132,6 +122,23 @@ def sanitize_floats(obj):
     return obj
 
 
+def _parse_feedback(text: str) -> list:
+    """Split aggregated feedback string into a list of individual feedback items."""
+    if not text or text.strip() in ("", "nan"):
+        return []
+    parts = [p.strip() for p in text.split(" | ") if p.strip() and p.strip() != "nan"]
+    return parts
+
+
+def _strip_markdown(text: str) -> str:
+    """Remove markdown bold/italic markers (**) from LLM output."""
+    if not text:
+        return text
+    cleaned = re.sub(r'\*{1,3}', '', text)
+    cleaned = re.sub(r'_{1,2}([^_]+)_{1,2}', r'\1', cleaned)
+    return cleaned.strip()
+
+
 def get_top_shap(shap_row: pd.Series, top_n: int = 5) -> list:
     top = shap_row.abs().nlargest(top_n)
     return [
@@ -146,7 +153,7 @@ def get_top_shap(shap_row: pd.Series, top_n: int = 5) -> list:
     ]
 
 
-# ─── NLP / Sentiment pipeline (aligned dengan notebook section 7) ─────────────
+# NLP / Sentiment pipeline (Section 7)
 
 def extract_sent_features(text: str) -> list:
     """
@@ -175,14 +182,6 @@ def extract_sent_features(text: str) -> list:
 
 
 def map_sentiment_tier(proba: float) -> str:
-    """
-    4-tier label sesuai notebook 2 baru (map_sentiment_tier_optimized, cell 7.4).
-    Threshold dioptimasi berdasarkan distribusi model aktual:
-      < 0.20 → Satisfied
-      < 0.50 → Neutral/Stable
-      < 0.80 → At Risk (Unsatisfied)
-      else   → Critical (Dissatisfied)
-    """
     if proba < 0.20:
         return "Satisfied"
     elif proba < 0.50:
@@ -282,25 +281,14 @@ def compute_nlp_flags(master: pd.DataFrame) -> pd.DataFrame:
     return master
 
 
-# ─── Core pipeline ─────────────────────────────────────────────────────────────
+# Core pipeline
 def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     """
     Full pipeline — setiap langkah selaras 1-to-1 dengan notebook_1 (section 2-8)
     dan notebook_2 (section 7 untuk sentimen).
 
-    Perbaikan vs versi lama:
-      (1) plan_type  : str.capitalize().str.strip()  (bukan .title())
-      (2) contract_type: str.strip() saja, tanpa ubah case (notebook 2.1)
-      (3) obs_date filter: bd/st/nps/um difilter ke record sebelum obs_date (notebook 2.6)
-      (4) days_since_login: .clip(lower=0) ditambahkan (notebook 4.2)
-      (5) Blanket fillna(0) dihapus — hanya kolom tertentu yang di-zero-fill (notebook 4.5)
-      (6) dunning_per_tenure: tenure_days bukan tenure_capped (notebook 4.6)
-      (7) ticket_per_revenue: total_tickets/(total_revenue.replace(0,1)/1000) (notebook 4.6)
-      (8) nps_x_dunning: fillna(5) bukan fillna(0), tanpa has_nps_data multiplier (notebook 4.6)
-      (9) NPS imputation: global median SEBELUM segmentasi (notebook 4.8)
-      (10) Model input: master[FEATURES].fillna(0) tepat sebelum predict (notebook 6.1)
     """
-    # ── 1. Clean (notebook section 2.1-2.5) ────────────────────────────────────
+    # 1. Clean (notebook section 2.1-2.5)
     ca_df  = ca_df.copy()
     bd_df  = bd_df.copy()
     um_df  = um_df.copy()
@@ -336,7 +324,7 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     # Deduplicate billing (notebook 2.4)
     bd_df = bd_df.drop_duplicates().reset_index(drop=True)
 
-    # ── 2. FIX (3): Filter record pasca-obs_date (notebook section 2.6) ────────
+    # 2. FIX (3): Filter record pasca-obs_date (notebook section 2.6) ────────
     bd_df  = (bd_df.merge(ca_df[["customer_id", "obs_date"]], on="customer_id")
                    .query("payment_date  <= obs_date")
                    .drop(columns="obs_date").reset_index(drop=True))
@@ -350,7 +338,7 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
                    .query("last_login_date <= obs_date")
                    .drop(columns="obs_date").reset_index(drop=True))
 
-    # ── 3. Billing features (notebook section 4.1) ─────────────────────────────
+    # 3. Billing features (notebook section 4.1)
     payments = bd_df[bd_df["record_type"] == "payment"].copy()
     payments["delay_days"] = (payments["payment_date"] - payments["billing_date"]).dt.days
     bf = payments.groupby("customer_id").agg(
@@ -366,16 +354,15 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     bf  = bf.merge(dun, on="customer_id", how="left")
     bf["dunning_count"] = bf["dunning_count"].fillna(0)
 
-    # ── 4. Usage features (notebook section 4.2) ───────────────────────────────
+    # 4. Usage features (notebook section 4.2)
     # Re-merge obs_date karena sudah di-drop saat filter
     uf = um_df.copy()
     uf = uf.merge(ca_df[["customer_id", "obs_date"]], on="customer_id", how="left")
-    # LEAKAGE FIX: days_since_login selalu pakai REFERENCE_DATE, bukan obs_date
     # FIX (4): tambahkan .clip(lower=0)
     uf["days_since_login"] = (REF - uf["last_login_date"]).dt.days.clip(lower=0)
     uf = uf.drop(columns=["last_login_date", "obs_date"], errors="ignore")
 
-    # ── 5. Ticket features (notebook section 4.3) ──────────────────────────────
+    # 5. Ticket features (notebook section 4.3)
     tf = st_df.groupby("customer_id").agg(
         total_tickets     =("ticket_id",  "count"),
         open_tickets      =("status",     lambda x: (x == "Open").sum()),
@@ -387,7 +374,7 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     tf["unresolved_ratio"] = tf["open_tickets"]     / tf["total_tickets"].replace(0, 1)
     tf["critical_ratio"]   = tf["critical_tickets"] / tf["total_tickets"].replace(0, 1)
 
-    # ── 6. NPS tabular features (notebook section 4.4) ─────────────────────────
+    # 6. NPS tabular features (notebook section 4.4)
     nf = nps_df.groupby("customer_id").agg(
         avg_nps_score =("nps_score", "mean"),
         min_nps_score =("nps_score", "min"),
@@ -396,13 +383,13 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     ).reset_index()
     nf["has_nps_data"] = 1
 
-    # ── 7. NPS text: feedback agregasi per customer ─────────────────────────────
+    # 7. NPS text: feedback agregasi per customer
     text_per = (nps_df.groupby("customer_id")["feedback_text"]
                 .apply(lambda x: " | ".join(x.dropna().astype(str)))
                 .reset_index())
     text_per.columns = ["customer_id", "all_feedback"]
 
-    # ── 8. Master merge (notebook section 4.5) ─────────────────────────────────
+    # 8. Master merge (notebook section 4.5)
     master = ca_df[["customer_id", "plan_type", "contract_type", "total_users",
                      "subscription_date", "obs_date"]].copy()
     master["tenure_days"] = (
@@ -424,7 +411,7 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     master[fill_zero]      = master[fill_zero].fillna(0)
     master["has_nps_data"] = master["has_nps_data"].fillna(0)
 
-    # ── 9. Interaction & ratio features (notebook section 4.6) ─────────────────
+    # 9. Interaction & ratio features (notebook section 4.6)
     master["log_total_revenue"]     = np.log1p(master["total_revenue"])
     master["log_monthly_usage_hrs"] = np.log1p(master["monthly_usage_hrs"])
     master["log_total_tickets"]     = np.log1p(master["total_tickets"])
@@ -451,7 +438,7 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
         master["avg_nps_score"].fillna(5) * (master["dunning_count"] + 1)
     )
 
-    # ── 10. Encoding & NPS imputation (notebook section 4.8) ───────────────────
+    # 10. Encoding & NPS imputation (notebook section 4.8)
     # FIX (9): NPS diimputasi dengan global median SEBELUM segmentasi
     master["plan_enc"]     = LE_PLAN.transform(master["plan_type"])
     master["contract_enc"] = LE_CONTRACT.transform(master["contract_type"])
@@ -460,7 +447,7 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
         med = master[col].median()
         master[col] = master[col].fillna(med)
 
-    # ── 11. Segmentation (notebook section 5) ──────────────────────────────────
+    # 11. Segmentation (notebook section 5)
     # SEG_FEATURES dari artifact = ['monthly_usage_hrs','feature_adoption_pct',
     #                                'total_revenue','payment_count','avg_nps_score']
     # SCALER_SEG di-fit pada raw values tersebut (bukan log)
@@ -471,11 +458,11 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     master["segment_cluster"] = KMEANS.predict(X_seg)
     master["segment_label"]   = master["segment_cluster"].map(LABEL_MAP)
 
-    # ── 12. Merge NPS text feedback ────────────────────────────────────────────
+    # 12. Merge NPS text feedback
     master = master.merge(text_per, on="customer_id", how="left")
     master["all_feedback"] = master["all_feedback"].fillna("")
 
-    # ── 13. VADER / NLP features ───────────────────────────────────────────────
+    # 13. VADER / NLP features
     vader_rows = master["all_feedback"].apply(compute_vader_features)
     vader_df   = pd.DataFrame(list(vader_rows))
     for col in vader_df.columns:
@@ -486,37 +473,32 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     )
     master["sentiment_label"] = master["dissatisfaction_proba"].apply(map_sentiment_tier)
 
-    # ── 14. Topic features (LDA dari notebook 2) ───────────────────────────────
+    # 14. Topic features (LDA dari notebook 2)
     topic_feats = compute_topic_features(master["all_feedback"].tolist())
     master["dominant_topic_label"] = topic_feats["dominant_topic_label"]
     master["dominant_topic_score"] = topic_feats["dominant_topic_score"]
 
-    # ── 15. Model prediction ───────────────────────────────────────────────────
-    # FIX (10): fillna(0) tepat sebelum predict, sesuai notebook:
-    #           X = master[PRODUCTION_FEATURES].fillna(0).values
+    # 5. Model prediction
     X_tab     = master[FEATURES].fillna(0).values
     tab_proba = MODEL.predict_proba(X_tab)[:, 1]
 
-    # ── 16. SHAP ───────────────────────────────────────────────────────────────
+    # 16. SHAP
     shap_vals = EXPLAINER.shap_values(master[FEATURES].fillna(0))
     if isinstance(shap_vals, list):
         shap_vals = shap_vals[1]
     shap_df = pd.DataFrame(shap_vals, columns=FEATURES)
 
-    # ── 17. Score & risk ───────────────────────────────────────────────────────
+    # 17. Score & risk
     churn_score = (tab_proba * 100).round(1)
     master["churn_proba"] = tab_proba.round(4)
     master["churn_score"] = churn_score
     master["risk_level"]  = [risk_level(s) for s in churn_score]
 
-    # ── 18. NLP flags ──────────────────────────────────────────────────────────
-    master = compute_nlp_flags(master)
-
-    # ── 19. Segment centroid RFM context ───────────────────────────────────────
+    # 18. Segment centroid RFM context
     centroids_raw = SCALER_SEG.inverse_transform(KMEANS.cluster_centers_)
     centroid_df   = pd.DataFrame(centroids_raw, columns=SEG_FEATURES)
 
-    # ── 20. Build output ───────────────────────────────────────────────────────
+    # 20. Build output
     results = []
     for i in range(len(master)):
         row      = master.iloc[i]
@@ -552,22 +534,22 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
         }
 
         results.append({
-            # ── Identity ──────────────────────────────────────────────────────
+            # Identity
             "customer_id":          row["customer_id"],
             "plan_type":            row["plan_type"],
             "contract_type":        row["contract_type"],
 
-            # ── Churn Score ───────────────────────────────────────────────────
+            # Churn Score
             "churn_score":          float(row["churn_score"]),
             "churn_proba":          round(float(tab_proba[i]), 4),
             "tabular_proba":        round(float(tab_proba[i]), 4),
             "nlp_proba":            round(float(tab_proba[i]), 4),
             "risk_level":           row["risk_level"],
 
-            # ── SHAP (tabular) ────────────────────────────────────────────────
+            # SHAP (tabular)
             "shap_top5":            get_top_shap(shap_df.iloc[i]),
 
-            # ── NLP / Sentiment ───────────────────────────────────────────────
+            # NLP / Sentiment
             "sentiment": {
                 "label":                 row["sentiment_label"],
                 "dissatisfaction_score": round(float(row["dissatisfaction_proba"]), 4),
@@ -578,15 +560,13 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
                 "urgency_score":         int(row["urgency_score"]),
                 "dominant_topic":        row["dominant_topic_label"],
                 "topic_strength":        round(float(row["dominant_topic_score"]), 3),
-                "feedback_preview":      str(row["all_feedback"])[:300],
+                "feedback_texts":        _parse_feedback(str(row["all_feedback"])),
             },
 
-            # ── NLP flags ─────────────────────────────────────────────────────
-            "nlp_red_flag":         int(row["nlp_red_flag"]),
-            "loyalty_risk_flag":    int(row["loyalty_risk_flag"]),
+            # NPS data flag
             "has_nps_data":         int(row["has_nps_data"]),
 
-            # ── Segmentation ──────────────────────────────────────────────────
+            # Segmentation
             "segment_label":        seg,
             "segment_cluster":      seg_cl,
             "segment_rfm_context":  seg_rfm_context,
@@ -597,58 +577,56 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
     return results
 
 
-# ─── LLM narrative builders ────────────────────────────────────────────────────
+# LLM narrative builders
 def build_churn_xai_prompt(r: dict) -> str:
     """Churn Prediction XAI prompt. Output: strict JSON."""
     shap_lines = "\n".join([
         f"  {idx+1}. {f['feature_label']} "
-        f"({'meningkatkan' if f['direction'] == 'increases_churn' else 'menurunkan'} risiko, "
+        f"({'increases' if f['direction'] == 'increases_churn' else 'decreases'} churn risk, "
         f"SHAP: {f['shap_value']:+.3f})"
         for idx, f in enumerate(r["shap_top5"])
     ])
     sent    = r["sentiment"]
     rfm     = r["segment_rfm_context"]
 
-    flags = []
-    if r.get("nlp_red_flag"):
-        flags.append("NLP Red Flag: sentimen sangat negatif + urgency tinggi")
-    if r.get("loyalty_risk_flag"):
-        flags.append("Loyalty Risk Flag: score rendah tapi segment Critical + tenure >1 tahun")
-    flag_section = ", ".join(flags) if flags else "Tidak ada"
+    tenure   = rfm.get("days_since_login", {}).get("customer", 0)
+    revenue  = rfm.get("total_revenue", {}).get("customer", 0)
+    usage    = rfm.get("monthly_usage_hrs", {}).get("customer", 0)
+    adoption = rfm.get("feature_adoption_pct", {}).get("customer", 0)
+    nps      = rfm.get("avg_nps_score", {}).get("customer", 0)
 
-    # Customer context for personalized action recommendation
-    tenure    = rfm.get("days_since_login", {}).get("customer", 0)
-    revenue   = rfm.get("total_revenue", {}).get("customer", 0)
-    usage     = rfm.get("monthly_usage_hrs", {}).get("customer", 0)
-    adoption  = rfm.get("feature_adoption_pct", {}).get("customer", 0)
-    nps       = rfm.get("avg_nps_score", {}).get("customer", 0)
+    feedback_items = sent.get("feedback_texts", [])
+    feedback_str   = " | ".join(feedback_items[:5]) if feedback_items else "No feedback available"
 
-    return f"""Anda adalah analis customer success senior. Balas HANYA dengan JSON valid, tanpa teks lain, tanpa markdown.
+    return f"""You are a senior customer success analyst. Reply ONLY with valid JSON, no other text, no markdown.
 
 CUSTOMER: {r['customer_id']} | Plan: {r['plan_type']} ({r['contract_type']}) | Segment: {r['segment_label']}
-Churn Score: {r['churn_score']}/100 | Risk: {r['risk_level']} | Probability: {r['churn_proba']*100:.1f}%
-Revenue: ${revenue:,.0f}/mo | Usage: {usage:.0f}h/mo | Adoption: {adoption:.0f}% | NPS: {nps:.1f}/10
-Days since login: {tenure:.0f} | Flags: {flag_section}
+Churn Score: {r['churn_score']}/100 | Risk: {r['risk_level']}
+Revenue: ${revenue:,.0f}/mo | Usage: {usage:.0f}h/mo | Feature Adoption: {adoption:.0f}% | NPS: {nps:.1f}/10
+Days since last login: {tenure:.0f}
 
-FAKTOR SHAP:
+TOP CHURN FACTORS (SHAP):
 {shap_lines}
 
-SENTIMEN: {sent['label'].upper()} | VADER: {sent['vader_compound']:+.3f} | Urgency: {sent['urgency_level']} ({sent['urgency_score']}) | Topik: {sent['dominant_topic']}
-Feedback: "{sent['feedback_preview'][:200]}"
+SENTIMENT: {sent['label']} | VADER: {sent['vader_compound']:+.3f} | Urgency: {sent['urgency_level']} | Topic: {sent['dominant_topic']}
+Feedback: "{feedback_str[:300]}"
 
-Berikan rekomendasi retain dan offer yang SPESIFIK untuk customer ini berdasarkan plan, revenue, usage, dan sentiment-nya. Jangan gunakan opsi generik. Sesuaikan dengan kondisi aktual customer.
+Instructions:
+- score_reason: 1-2 plain sentences explaining why this customer has this churn score. Use the actual numbers. Be specific.
+- risk_factors: 3 short phrases (max 8 words each), one per top churn driver.
+- feedback_signal: 1 plain sentence summarizing what the customer is complaining about.
+- retain: exactly 3 short action items (max 10 words each) specific to this customer's situation.
+- offer: exactly 3 short offer items (max 10 words each) specific to this customer's plan and revenue.
+Do not use asterisks, bold, or markdown in any value.
 
-Balas JSON (bahasa Indonesia, singkat dan actionable):
-{{"score_reason":"...","risk_factors":["...","...","..."],"feedback_signal":"...","action":{{"retain":"aksi retensi spesifik untuk customer ini","offer":"penawaran spesifik untuk customer ini","reason":"..."}}}}"""
+Reply JSON:
+{{"score_reason":"...","risk_factors":["...","...","..."],"feedback_signal":"...","action":{{"retain":["...","...","..."],"offer":["...","...","..."],"reason":"..."}}}}"""
 
 
 def build_segment_xai_prompt(r: dict) -> str:
-    """
-    Segment XAI prompt — replaces hardcoded narasi di SegmentationPage.tsx.
-    Output: strict JSON dengan data yang bisa langsung ditampilkan di frontend.
-    """
-    rfm     = r["segment_rfm_context"]
-    sent    = r["sentiment"]
+    """Segment XAI prompt. Output: strict JSON."""
+    rfm      = r["segment_rfm_context"]
+    sent     = r["sentiment"]
     seg_prof = r["segment_profile"]
     seg_act  = r["segment_actions"]
 
@@ -657,70 +635,58 @@ def build_segment_xai_prompt(r: dict) -> str:
         for k, v in rfm.items()
     ])
 
-    flags = []
-    if r.get("nlp_red_flag"):
-        flags.append("NLP Red Flag aktif (sentimen negatif + urgency)")
-    if r.get("loyalty_risk_flag"):
-        flags.append("Loyalty Risk Flag aktif (tenure lama tapi di segmen kritis)")
-    flag_str = ", ".join(flags) if flags else "Tidak ada"
+    return f"""You are a senior customer success analyst. Reply ONLY with valid JSON, no other text, no markdown.
 
-    return f"""Anda adalah analis customer success senior. Balas HANYA dengan JSON valid, tanpa teks lain, tanpa markdown, tanpa komentar.
-
-PROFIL CUSTOMER:
+CUSTOMER PROFILE:
 ID: {r['customer_id']} | Plan: {r['plan_type']} ({r['contract_type']})
 Segment: {r['segment_label']} | Churn Score: {r['churn_score']}/100 | Risk: {r['risk_level']}
 
-NILAI RFM vs RATA-RATA SEGMENT:
+CUSTOMER vs SEGMENT AVERAGES:
 {rfm_lines}
 
-PROFIL SEGMENT:
-Jumlah customer: {seg_prof.get('count', 'N/A')} | Avg churn score: {seg_prof.get('avg_churn_score', 'N/A')}/100
-% High risk: {seg_prof.get('pct_high_risk', 'N/A')}% | Avg tenure: {seg_prof.get('avg_tenure_days', 'N/A')} hari
-Deskripsi segmen: {seg_act.get('description', '')}
+SEGMENT PROFILE:
+Customers: {seg_prof.get('count', 'N/A')} | Avg churn score: {seg_prof.get('avg_churn_score', 'N/A')}/100
+% High risk: {seg_prof.get('pct_high_risk', 'N/A')}% | Avg tenure: {seg_prof.get('avg_tenure_days', 'N/A')} days
+Description: {seg_act.get('description', '')}
 
-SENTIMEN & FLAGS:
-{sent['label']} (VADER: {sent['vader_compound']:+.3f}) | Topik: {sent['dominant_topic']} | Urgency: {sent['urgency_level']}
-Flags aktif: {flag_str}
+SENTIMENT:
+{sent['label']} (VADER: {sent['vader_compound']:+.3f}) | Topic: {sent['dominant_topic']} | Urgency: {sent['urgency_level']}
 
-RECOMMENDED ACTIONS (plan-based):
-Retain: {seg_act.get('retain', [])}
-Offer: {seg_act.get('offer', [])}
+Do not use asterisks, bold, or markdown in any value.
 
-Balas JSON (bahasa Indonesia, singkat):
-{{"segment_reason":"...","characteristics":["...","...","..."],"watch_out":"...","strategy":"..."}}"""
+Reply JSON:
+{{"segment_reason":"1-2 plain sentences why this customer belongs here","characteristics":["trait 1","trait 2","trait 3"],"watch_out":"1 plain sentence about the main concern","strategy":"1 plain sentence about the best action"}}"""
 
 
 def build_segment_cohort_prompt(seg_label: str, seg_prof: dict, seg_desc: str,
                                  retain_actions: list, offer_actions: list,
                                  total_customers: int) -> str:
-    """
-    Prompt untuk narasi-level segment (bukan per-customer) — digunakan di halaman Segmentation
-    untuk menggantikan teks hardcoded di getSegmentDescriptionAndTraits().
-    Dipanggil sekali per segment setelah analyze all selesai.
-    """
+    """Segment cohort narrative prompt — one call per segment, not per customer."""
     share_pct = round(seg_prof.get("count", 0) / max(total_customers, 1) * 100, 1)
 
-    return f"""Anda adalah analis customer success senior. Balas HANYA dengan JSON valid, tanpa teks lain, tanpa markdown.
+    return f"""You are a senior customer success analyst. Reply ONLY with valid JSON, no other text, no markdown.
 
-DATA SEGMENT: {seg_label}
-Total customers: {seg_prof.get('count', 'N/A')} ({share_pct}% dari keseluruhan)
+SEGMENT DATA: {seg_label}
+Total customers: {seg_prof.get('count', 'N/A')} ({share_pct}% of all customers)
 Avg churn score: {seg_prof.get('avg_churn_score', 'N/A')}/100
 % High risk: {seg_prof.get('pct_high_risk', 'N/A')}%
 Avg revenue: ${seg_prof.get('avg_revenue', 0):,.0f}/month
 Avg usage hrs: {seg_prof.get('avg_usage_hrs', 0):.0f}h/month
 Avg NPS: {seg_prof.get('avg_nps', 0):.1f}/10
-Avg tenure: {seg_prof.get('avg_tenure_days', 0):.0f} hari
+Avg tenure: {seg_prof.get('avg_tenure_days', 0):.0f} days
 Churn rate: {seg_prof.get('churn_rate', 0)*100:.1f}%
-Deskripsi internal: {seg_desc}
-Aksi retensi tersedia: {retain_actions}
-Penawaran tersedia: {offer_actions}
+Description: {seg_desc}
+Retention actions available: {retain_actions}
+Offers available: {offer_actions}
 
-Balas dengan JSON persis seperti ini:
+Do not use asterisks, bold, or markdown in any value.
+
+Reply with this exact JSON:
 {{
-  "narrative": "3-4 kalimat deskripsi komprehensif kohort ini: karakteristik utama, perilaku, dan situasi bisnis mereka",
-  "defining_traits": ["trait singkat 1 (maks 4 kata)", "trait singkat 2", "trait singkat 3", "trait singkat 4"],
-  "top_priority_action": "1 kalimat rekomendasi aksi prioritas tertinggi untuk segment ini",
-  "risk_summary": "1 kalimat ringkasan risiko churn untuk segment ini"
+  "narrative": "3-4 plain sentences describing this segment: key characteristics, behavior, and business situation",
+  "defining_traits": ["short trait 1 (max 4 words)", "short trait 2", "short trait 3", "short trait 4"],
+  "top_priority_action": "1 plain sentence with the single highest-priority action for this segment",
+  "risk_summary": "1 plain sentence summarizing the churn risk for this segment"
 }}"""
 
 
@@ -779,6 +745,7 @@ async def _call_llm_xai(prompt: str) -> str:
         # Strip <think>…</think> blocks emitted by some reasoning models
         content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
         content = re.sub(r"^```(?:json)?\s*", "", content).rstrip("```").strip()
+        content = _strip_markdown(content)
         return content
 
     except httpx.ConnectError as e:
@@ -789,7 +756,7 @@ async def _call_llm_xai(prompt: str) -> str:
         return json.dumps({"error": f"{type(e).__name__}: {str(e)[:100]}"})
 
 
-# ─── Endpoints ─────────────────────────────────────────────────────────────────
+# Endpoints
 class SegmentCohortRequest(BaseModel):
     segment_label: str
     total_customers: int
@@ -889,7 +856,7 @@ async def predict(
             r["xai_churn_explanation"]   = await _call_llm_xai(build_churn_xai_prompt(r))
             r["xai_segment_explanation"] = await _call_llm_xai(build_segment_xai_prompt(r))
 
-        # ── Per-segment cohort narratives (new in v10) ─────────────────────────
+        # Per-segment cohort narratives
         # Aggregate segment stats from results, then call LLM once per segment
         total_customers = len(results)
         seen_segments: set[str] = set()
@@ -968,7 +935,7 @@ async def predict_single(
     return sanitize_floats(r)
 
 
-# ─── Simulation: Churn Trajectory ────────────────────────────────────────────
+# Simulation: Churn Trajectory
 
 from fastapi.responses import StreamingResponse  # noqa: E402
 
@@ -1076,8 +1043,6 @@ class _CustomerDataSim(BaseModel):
     shap_top5:           list
     sentiment:           dict
     segment_rfm_context: dict
-    nlp_red_flag:        int = 0
-    loyalty_risk_flag:   int = 0
 
 
 class SimulateRequest(BaseModel):
@@ -1101,6 +1066,10 @@ def _build_ctx(c: _CustomerDataSim, scenario: str) -> str:
     adoption = rfm.get("feature_adoption_pct", {}).get("customer", 0)
     nps      = rfm.get("avg_nps_score",        {}).get("customer", 0)
     dsl      = rfm.get("days_since_login",     {}).get("customer", 0)
+
+    feedback_items = c.sentiment.get("feedback_texts", [])
+    feedback_preview = feedback_items[0][:150] if feedback_items else "No feedback"
+
     ctx = (
         f"CUSTOMER: {c.customer_id} | Plan: {c.plan_type} ({c.contract_type}) | Segment: {c.segment_label}\n"
         f"Churn Score: {c.churn_score:.1f}/100 | Risk Level: {c.risk_level}\n"
@@ -1109,9 +1078,7 @@ def _build_ctx(c: _CustomerDataSim, scenario: str) -> str:
         f"Sentiment: {c.sentiment.get('label', 'N/A')} "
         f"(VADER: {c.sentiment.get('vader_compound', 0):+.3f}) | "
         f"Urgency: {c.sentiment.get('urgency_level', 'N/A')}\n"
-        f"Feedback preview: \"{c.sentiment.get('feedback_preview', '')[:200]}\"\n"
-        f"NLP Red Flag: {'Yes' if c.nlp_red_flag else 'No'} | "
-        f"Loyalty Risk: {'Yes' if c.loyalty_risk_flag else 'No'}\n\n"
+        f"Feedback: \"{feedback_preview}\"\n\n"
         f"TOP CHURN DRIVERS (SHAP):\n{shap_txt}"
     )
     if scenario.strip():
@@ -1228,43 +1195,43 @@ Rules:
 """
 
 _SIM_NARRATIVE_SYSTEM = """\
-Kamu adalah analis customer success senior di perusahaan SaaS.
-Tulis TEPAT 4 paragraf singkat (2-3 kalimat per paragraf) dalam Bahasa Indonesia yang bermakna:
+You are a senior customer success analyst at a SaaS company.
+Write EXACTLY 4 short paragraphs (2-3 sentences each) in plain English:
 
-Paragraf 1: Kondisi risiko churn saat ini — sebut skor, faktor SHAP utama beserta angkanya, dan apa artinya bagi akun ini.
-Paragraf 2: Proyeksi trajektori — ke mana probabilitas churn bergerak selama periode ini dan faktor pendorongnya.
-Paragraf 3: Window retensi dan eksposur finansial — berapa lama waktu tersisa dan berapa revenue yang berisiko hilang.
-Paragraf 4: Satu tindakan prioritas paling mendesak dengan timeline konkret dan ekspektasi hasilnya.
+Paragraph 1: Current churn risk — state the score, the top SHAP factors with their values, and what this means for the account.
+Paragraph 2: Trajectory forecast — where the churn probability is heading over this period and the key drivers.
+Paragraph 3: Retention window and financial exposure — how much time is left and how much revenue is at risk.
+Paragraph 4: The single most urgent action with a concrete timeline and expected outcome.
 
-Pisahkan setiap paragraf dengan satu baris kosong.
-Aturan: Tanpa bullet point. Tanpa header. Tanpa markdown. Tulis langsung tanpa pembuka.
+Separate each paragraph with one blank line.
+Rules: No bullet points. No headers. No markdown. No asterisks. Write directly without an opening phrase.
 """
 
 _SCENARIO_NARRATIVE_SYSTEM = """\
-Kamu adalah analis customer success senior di perusahaan SaaS.
-Tulis TEPAT 4 paragraf singkat (2-3 kalimat per paragraf) dalam Bahasa Indonesia yang bermakna:
+You are a senior customer success analyst at a SaaS company.
+Write EXACTLY 4 short paragraphs (2-3 sentences each) in plain English:
 
-Paragraf 1: Apa yang diusulkan skenario ini dan proyeksi perubahan probabilitas churn (gunakan angka spesifik).
-Paragraf 2: Argumen pro terkuat mengapa intervensi ini berpotensi berhasil berdasarkan data pelanggan.
-Paragraf 3: Risiko atau kontra dari skenario ini — apa yang bisa gagal dan kondisi apa yang perlu dipenuhi.
-Paragraf 4: Langkah konkret berikutnya dengan timeline spesifik dan metrik keberhasilan yang bisa diukur.
+Paragraph 1: What this scenario proposes and the projected change in churn probability (use specific numbers).
+Paragraph 2: The strongest reason why this intervention could succeed based on the customer data.
+Paragraph 3: The main risks or downsides — what could fail and what conditions must be met.
+Paragraph 4: The concrete next steps with a specific timeline and measurable success metrics.
 
-Pisahkan setiap paragraf dengan satu baris kosong.
-Aturan: Tanpa bullet point. Tanpa header. Tanpa markdown. Tulis langsung tanpa pembuka.
+Separate each paragraph with one blank line.
+Rules: No bullet points. No headers. No markdown. No asterisks. Write directly without an opening phrase.
 """
 
 _ASK_SYSTEM = """\
-Kamu adalah asisten analitik customer success yang ahli di perusahaan SaaS.
-Jawab pertanyaan pengguna berdasarkan data pelanggan dan konteks simulasi yang tersedia.
-Gunakan Bahasa Indonesia yang profesional dan mudah dipahami oleh tim bisnis.
-Format: 2-4 paragraf singkat atau poin-poin ringkas yang relevan.
-Sertakan angka dari data jika relevan. Hindari markdown berlebihan.
-Jawab langsung tanpa kalimat pembuka seperti "Tentu saja" atau "Berdasarkan data".
+You are a customer success analytics assistant at a SaaS company.
+Answer the user's question based on the available customer data and simulation context.
+Use plain, professional English that is easy for a business team to understand.
+Format: 2-4 short paragraphs or concise bullet points, whichever fits better.
+Include numbers from the data when relevant.
+Do not use markdown bold (**), asterisks, or headers.
+Answer directly without openers like "Sure" or "Based on the data".
 """
 
-# ─── Unified Agent Config ─────────────────────────────────────────────────────
+# Unified Agent Config
 # One list of persona metadata. System prompts are selected per-mode below.
-
 AGENT_PERSONAS = [
     {"name": "Risk Analyst",    "short": "RA", "color": "#ef4444"},
     {"name": "Customer Success","short": "CS", "color": "#3b82f6"},
@@ -1272,91 +1239,73 @@ AGENT_PERSONAS = [
     {"name": "Product Manager", "short": "PM", "color": "#8b5cf6"},
 ]
 
-# Prompts for "initial" mode — agents examine baseline situation in Indonesian
+# Prompts for "initial" mode — agents examine baseline situation in English
 AGENT_ANALYZE_SYSTEMS: dict[str, str] = {
     "Risk Analyst": (
-        "Kamu adalah Analis Risiko Churn di perusahaan SaaS. "
-        "Tinjau skor churn, faktor risiko SHAP teratas, dan trajektori pelanggan ini. "
-        "Berikan analisis dalam format poin-poin (3-4 poin) menggunakan bullet point (-):\n"
-        "- Identifikasi faktor risiko paling kritis beserta nilai SHAP aktualnya\n"
-        "- Dampak setiap faktor terhadap probabilitas churn\n"
-        "- Tren yang perlu diwaspadai\n"
-        "- Satu rekomendasi konkret paling efektif\n"
-        "Gunakan angka aktual. Bahasa Indonesia yang ringkas dan profesional."
+        "You are a Churn Risk Analyst at a SaaS company. "
+        "Review this customer's churn score, top SHAP risk factors, and trajectory. "
+        "Give 4-5 bullet points using - (hyphen). Each point is one short, clear sentence. No asterisks or bold.\n"
+        "Cover: most critical risk factor with its SHAP value, what is driving churn up, "
+        "one trend to watch, and one specific action to reduce risk. "
+        "Use actual numbers from the data."
     ),
     "Customer Success": (
-        "Kamu adalah Customer Success Manager di perusahaan SaaS. "
-        "Analisis waktu login terakhir, skor NPS, sentimen feedback, dan sinyal keterlibatan pelanggan ini. "
-        "Berikan analisis dalam format poin-poin (3-4 poin) menggunakan bullet point (-):\n"
-        "- Akar masalah ketidakaktifan atau ketidakpuasan utama\n"
-        "- Sinyal keterlibatan yang perlu diperhatikan\n"
-        "- Kondisi sentimen pelanggan saat ini\n"
-        "- Satu tindakan outreach spesifik yang bisa dilakukan minggu ini\n"
-        "Bahasa Indonesia yang ringkas dan profesional."
+        "You are a Customer Success Manager at a SaaS company. "
+        "Analyze this customer's last login, NPS score, feedback sentiment, and engagement signals. "
+        "Give 4-5 bullet points using - (hyphen). Each point is one short, clear sentence. No asterisks or bold.\n"
+        "Cover: root cause of disengagement or dissatisfaction, key engagement signal, "
+        "current sentiment summary, and one specific outreach action to take this week."
     ),
     "Finance Analyst": (
-        "Kamu adalah Analis Keuangan di perusahaan SaaS. "
-        "Gunakan data revenue dan probabilitas churn pelanggan ini. "
-        "Berikan analisis dalam format poin-poin (3-4 poin) menggunakan bullet point (-):\n"
-        "- Estimasi potensi kerugian revenue jika pelanggan churn (dalam angka)\n"
-        "- Konteks nilai pelanggan vs rata-rata segmen\n"
-        "- Kelayakan ekonomi dari intervensi retensi\n"
-        "- Satu penawaran retensi hemat biaya dengan nilai konkret\n"
-        "Bahasa Indonesia yang ringkas dan profesional."
+        "You are a Finance Analyst at a SaaS company. "
+        "Use this customer's revenue data and churn probability. "
+        "Give 4-5 bullet points using - (hyphen). Each point is one short, clear sentence. No asterisks or bold.\n"
+        "Cover: estimated revenue loss if customer churns, customer value vs segment average, "
+        "economic case for intervention, and one cost-effective retention offer with a concrete value."
     ),
     "Product Manager": (
-        "Kamu adalah Product Manager di perusahaan SaaS. "
-        "Periksa tingkat adopsi fitur dan jam penggunaan produk pelanggan ini. "
-        "Berikan analisis dalam format poin-poin (3-4 poin) menggunakan bullet point (-):\n"
-        "- Kesenjangan adopsi fitur yang paling berkontribusi pada risiko churn\n"
-        "- Pola penggunaan yang mengkhawatirkan\n"
-        "- Fitur potensial yang belum dimanfaatkan\n"
-        "- Satu tindakan produk spesifik untuk menutup kesenjangan tersebut\n"
-        "Bahasa Indonesia yang ringkas dan profesional."
+        "You are a Product Manager at a SaaS company. "
+        "Review this customer's feature adoption rate and product usage hours. "
+        "Give 4-5 bullet points using - (hyphen). Each point is one short, clear sentence. No asterisks or bold.\n"
+        "Cover: the biggest feature adoption gap driving churn risk, concerning usage pattern, "
+        "most relevant unused feature, and one specific product action to close the gap."
     ),
 }
 
-# Prompts for "scenario" mode — agents debate a specific intervention in Indonesian
+# Prompts for "scenario" mode — agents debate a specific intervention in English
 AGENT_SCENARIO_SYSTEMS: dict[str, str] = {
     "Risk Analyst": (
-        "Kamu adalah Analis Risiko Churn di perusahaan SaaS. "
-        "Berdasarkan data pelanggan dan skenario intervensi yang diusulkan, "
-        "berikan analisis dalam format poin-poin (3-4 poin) menggunakan bullet point (-):\n"
-        "- Estimasi pengurangan probabilitas churn (dalam poin persentase)\n"
-        "- Faktor risiko yang paling terpengaruh oleh intervensi ini\n"
-        "- Risiko sisa jika intervensi tidak berjalan sesuai rencana\n"
-        "- Probabilitas keberhasilan intervensi ini\n"
-        "Bahasa Indonesia yang ringkas dan profesional."
+        "You are a Churn Risk Analyst at a SaaS company. "
+        "Based on the customer data and the proposed intervention scenario, "
+        "give 4-5 bullet points using - (hyphen). Each point is one short, clear sentence. No asterisks or bold.\n"
+        "Cover: estimated churn probability reduction in percentage points, "
+        "which risk factor is most affected, residual risk if the intervention fails, "
+        "and your confidence in this intervention succeeding."
     ),
     "Customer Success": (
-        "Kamu adalah Customer Success Manager di perusahaan SaaS. "
-        "Berdasarkan data pelanggan dan intervensi yang diusulkan, "
-        "berikan analisis dalam format poin-poin (3-4 poin) menggunakan bullet point (-):\n"
-        "- Apakah intervensi ini menyentuh akar masalah churn secara tepat?\n"
-        "- Kondisi pelanggan yang mendukung atau menghambat keberhasilan\n"
-        "- Yang harus menyertai intervensi ini agar berhasil\n"
-        "- Timeline pelaksanaan yang realistis\n"
-        "Bahasa Indonesia yang ringkas dan profesional."
+        "You are a Customer Success Manager at a SaaS company. "
+        "Based on the customer data and the proposed intervention, "
+        "give 4-5 bullet points using - (hyphen). Each point is one short, clear sentence. No asterisks or bold.\n"
+        "Cover: whether this intervention addresses the real root cause of churn, "
+        "what in the customer's situation supports or blocks success, "
+        "what must accompany this intervention, and a realistic execution timeline."
     ),
     "Finance Analyst": (
-        "Kamu adalah Analis Keuangan di perusahaan SaaS. "
-        "Berdasarkan data pelanggan dan intervensi yang diusulkan, "
-        "berikan analisis dalam format poin-poin (3-4 poin) menggunakan bullet point (-):\n"
-        "- Estimasi biaya intervensi vs revenue bulanan yang berisiko\n"
-        "- Kalkulasi ROI jika intervensi berhasil (gunakan angka konkret)\n"
-        "- Break-even point intervensi ini\n"
-        "- Rekomendasi dari perspektif finansial\n"
-        "Bahasa Indonesia yang ringkas dan profesional."
+        "You are a Finance Analyst at a SaaS company. "
+        "Based on the customer data and the proposed intervention, "
+        "give 4-5 bullet points using - (hyphen). Each point is one short, clear sentence. No asterisks or bold.\n"
+        "Cover: estimated intervention cost vs monthly revenue at risk, "
+        "ROI if the intervention succeeds with concrete numbers, "
+        "break-even point, and your financial recommendation."
     ),
     "Product Manager": (
-        "Kamu adalah Product Manager di perusahaan SaaS. "
-        "Berdasarkan data pelanggan dan intervensi yang diusulkan, "
-        "berikan analisis dalam format poin-poin (3-4 poin) menggunakan bullet point (-):\n"
-        "- Dampak intervensi terhadap adopsi fitur dan keterlibatan produk\n"
-        "- Fitur atau alur yang paling relevan untuk intervensi ini\n"
-        "- Perubahan produk yang akan memperkuat efek intervensi\n"
-        "- Metrik produk yang harus dimonitor\n"
-        "Bahasa Indonesia yang ringkas dan profesional."
+        "You are a Product Manager at a SaaS company. "
+        "Based on the customer data and the proposed intervention, "
+        "give 4-5 bullet points using - (hyphen). Each point is one short, clear sentence. No asterisks or bold.\n"
+        "Cover: impact on feature adoption and product engagement, "
+        "most relevant feature or flow for this intervention, "
+        "product change that would strengthen the outcome, "
+        "and the key product metric to monitor."
     ),
 }
 
@@ -1373,22 +1322,21 @@ def _build_contextual_fallback(
     segment  = customer_profile.get("segment_label", "")
     plan     = customer_profile.get("plan_type", "")
     contract = customer_profile.get("contract_type", "")
-    shap5    = customer_profile.get("shap_top5", [])  # list of dicts
+    shap5    = customer_profile.get("shap_top5", [])
 
-    # ── Map SHAP feature labels → concrete action strings ──────────────────────
     _FACTOR_ACTIONS: dict[str, str] = {
-        "days since login":     "Kampanye reaktivasi login dengan demo fitur terbaru",
-        "monthly usage hrs":    "Sesi onboarding intensif untuk meningkatkan jam penggunaan",
-        "avg payment delay":    "Review opsi pembayaran dan aktifkan tagihan otomatis",
-        "feature adoption":     "Pelatihan fitur premium 1-on-1 bersama CSM selama 30 hari",
-        "adoption x usage":     "Sprint aktivasi fitur utama dengan panduan step-by-step",
-        "nps score":            "NPS recovery call dan resolusi keluhan dalam 24 jam",
-        "avg nps score":        "NPS recovery call dan resolusi keluhan dalam 24 jam",
-        "tenure days":          "Program loyalitas eksklusif dan apresiasi untuk pelanggan lama",
-        "contract type":        "Konversi ke kontrak tahunan dengan diskon 25%",
-        "plan type":            "Upgrade plan ke tier lebih tinggi dengan trial 30 hari gratis",
-        "support tickets":      "Fast-track semua tiket terbuka dan assign support prioritas",
-        "billing issues":       "Audit billing, hapus biaya tidak jelas, tawarkan kredit",
+        "days since login":     "Run a re-engagement campaign with a live feature demo",
+        "monthly usage hrs":    "Schedule an intensive onboarding session to increase usage",
+        "avg payment delay":    "Review payment options and enable auto-billing",
+        "feature adoption":     "Run a 30-day 1-on-1 premium feature training with CSM",
+        "adoption x usage":     "Launch a feature activation sprint with step-by-step guidance",
+        "nps score":            "Conduct an NPS recovery call and resolve complaints within 24h",
+        "avg nps score":        "Conduct an NPS recovery call and resolve complaints within 24h",
+        "tenure days":          "Offer a loyalty appreciation program for long-term customers",
+        "contract type":        "Convert to annual contract with a 25% discount",
+        "plan type":            "Upgrade to a higher plan with a free 30-day trial",
+        "support tickets":      "Fast-track all open tickets and assign a priority support agent",
+        "billing issues":       "Audit billing, remove unclear charges, and offer account credit",
     }
 
     pool: list[str] = []
@@ -1399,70 +1347,63 @@ def _build_contextual_fallback(
             seen.add(rec)
             pool.append(rec)
 
-    # ── 1. SHAP-driven recs (top factors that INCREASE churn risk) ─────────────
     for factor in shap5[:3]:
         label  = str(factor.get("feature_label", "")).lower()
         shap_v = float(factor.get("shap_value", 0))
-        if shap_v <= 0:          # negative SHAP = reduces risk → skip
+        if shap_v <= 0:
             continue
         for key, action in _FACTOR_ACTIONS.items():
             if key in label or label in key:
                 add(action)
                 break
 
-    # ── 2. Segment-based recs ──────────────────────────────────────────────────
     seg = segment.lower()
     if any(x in seg for x in ("critical", "at-risk", "at risk")):
-        add("Eskalasi ke tim senior dan buat retention plan darurat 30 hari")
-        add("Hubungi decision maker langsung untuk win-back meeting")
+        add("Escalate to senior team and create a 30-day emergency retention plan")
+        add("Contact the decision maker directly for a win-back meeting")
     elif "champion" in seg:
-        add("Tawarkan early access fitur eksklusif sebagai apresiasi loyalitas")
-        add("Program ambassador dengan benefit tambahan dan diskon renewal")
+        add("Offer early access to exclusive features as a loyalty reward")
+        add("Launch an ambassador program with renewal discounts and extra benefits")
     elif "loyalist" in seg:
-        add("Program loyalitas VIP dengan benefit eksklusif jangka panjang")
-        add("Undangan ke customer advisory board dan sesi feedback eksklusif")
+        add("Enroll in a VIP loyalty program with long-term exclusive benefits")
+        add("Invite to the customer advisory board for exclusive feedback sessions")
     elif any(x in seg for x in ("potential", "prospect")):
-        add("Sesi konsultasi gratis untuk temukan nilai produk yang paling relevan")
-        add("Tawarkan paket yang lebih sesuai kebutuhan saat ini dengan harga khusus")
+        add("Schedule a free consultation to find the most relevant product value")
+        add("Offer a plan better suited to current needs at a special price")
 
-    # ── 3. Plan-based recs ─────────────────────────────────────────────────────
     p = plan.lower()
     if any(x in p for x in ("basic", "starter", "free")):
-        add("Upgrade ke Pro plan dengan trial 60 hari gratis tanpa komitmen")
+        add("Upgrade to Pro plan with a free 60-day trial, no commitment required")
     elif any(x in p for x in ("enterprise", "business", "corporate")):
-        add("Assign dedicated account manager dan quarterly executive business review")
+        add("Assign a dedicated account manager and schedule a quarterly executive review")
     elif "pro" in p:
-        add("Aktifkan fitur enterprise add-on dengan harga khusus selama 3 bulan")
+        add("Activate enterprise add-on features at a special rate for 3 months")
 
-    # ── 4. Contract-based recs ─────────────────────────────────────────────────
     ct = contract.lower()
     if "month" in ct:
-        add("Konversi ke kontrak tahunan dengan diskon 30% dan lock-in pricing")
+        add("Convert to annual contract with a 30% discount and price lock-in")
     elif any(x in ct for x in ("annual", "year")):
-        add("Perpanjang kontrak 2 tahun dengan freeze harga dan bonus kredit fitur")
+        add("Extend to a 2-year contract with a price freeze and feature credits")
 
-    # ── 5. Urgency recs by risk level ──────────────────────────────────────────
     if risk_level == "High":
-        add("Freeze billing 2 bulan + akses semua fitur premium gratis")
-        add("Hubungi customer dalam 24 jam untuk intervensi retensi darurat")
+        add("Freeze billing for 2 months and grant full premium feature access")
+        add("Contact customer within 24 hours for emergency retention intervention")
     elif risk_level == "Medium":
-        add("Check-in mingguan otomatis via CSM selama 8 minggu ke depan")
-        add("Tawarkan diskon 20% untuk perpanjangan kontrak 6 bulan")
+        add("Schedule automated weekly CSM check-ins for the next 8 weeks")
+        add("Offer a 20% discount for a 6-month contract extension")
     else:
-        add("Kirim survei kepuasan dan aktifkan program referral eksklusif")
-        add("Berikan kredit bonus penggunaan sebagai apresiasi loyalitas")
+        add("Send a satisfaction survey and activate an exclusive referral program")
+        add("Give a usage credit bonus as a loyalty appreciation gesture")
 
-    # ── 6. Scenario follow-up: suggest complementary angles ───────────────────
     if scenario.strip():
-        add("Kombinasikan intervensi di atas dengan insentif loyalitas jangka panjang")
-        add("Uji A/B: diskon harga vs peningkatan intensitas layanan CSM")
+        add("Combine the above intervention with a long-term loyalty incentive")
+        add("A/B test: price discount vs increased CSM service intensity")
 
-    # ── Pad with safe generics if pool is still short ─────────────────────────
     _generics = [
-        "Lakukan business review bulanan dan monitoring metrik kesehatan akun",
-        "Berikan akses fitur premium gratis selama 60 hari",
-        "Assign Customer Success Manager dedicated selama 90 hari",
-        "Tawarkan diskon 20% untuk perpanjangan kontrak 6 bulan",
+        "Schedule a monthly business review and monitor account health metrics",
+        "Grant free premium feature access for 60 days",
+        "Assign a dedicated Customer Success Manager for 90 days",
+        "Offer a 20% discount for a 6-month contract extension",
     ]
     for g in _generics:
         if len(pool) >= 4:
@@ -1491,28 +1432,28 @@ async def _extract_recommendations(
     )
     if scenario.strip():
         context_note = (
-            f"Tim analis baru saja mendiskusikan intervensi ini: \"{scenario}\".\n"
-            f"Buat 4 skenario LANJUTAN atau ALTERNATIF yang layak disimulasikan berikutnya."
+            f"The analyst team just discussed this intervention: \"{scenario}\".\n"
+            f"Generate 4 FOLLOW-UP or ALTERNATIVE scenarios worth simulating next."
         )
     else:
         context_note = (
-            "Tim analis baru saja menganalisis situasi churn baseline pelanggan ini.\n"
-            "Buat 4 skenario INTERVENSI yang layak disimulasikan untuk mengurangi risiko churn."
+            "The analyst team just analyzed this customer's baseline churn situation.\n"
+            "Generate 4 INTERVENTION scenarios worth simulating to reduce churn risk."
         )
 
     prompt = (
         f"{context_note}\n\n"
-        f"Aturan:\n"
-        f"- Setiap opsi harus berupa frasa tindakan pendek dan spesifik (15-70 karakter)\n"
-        f"- Tulis dalam Bahasa Indonesia\n"
-        f"- Cukup konkret untuk dijadikan input skenario simulasi\n"
-        f"- Bervariasi — jangan mengulang ide yang sama\n\n"
-        f"Konteks pelanggan:\n"
+        f"Rules:\n"
+        f"- Each option must be a short, specific action phrase (15-70 characters)\n"
+        f"- Write in English\n"
+        f"- Concrete enough to be used as a simulation scenario input\n"
+        f"- Varied — do not repeat the same idea\n\n"
+        f"Customer context:\n"
         f"{ctx[:200]}\n\n"
-        f"Output analisis agen:\n{debate_text}\n\n"
-        f"Kembalikan HANYA array JSON valid berisi tepat 4 string. "
-        f"Contoh: [\"Tawarkan diskon 20% selama 3 bulan\", \"Assign CSM dedicated\", ...]\n"
-        f"Tanpa penjelasan, tanpa markdown fence, tanpa teks tambahan."
+        f"Agent analysis outputs:\n{debate_text}\n\n"
+        f"Return ONLY a valid JSON array with exactly 4 strings. "
+        f"Example: [\"Offer 20% discount for 3 months\", \"Assign dedicated CSM\", ...]\n"
+        f"No explanation, no markdown fence, no extra text."
     )
 
     # Pre-build contextual fallback (zero extra LLM calls, uses real customer data)
@@ -1520,7 +1461,7 @@ async def _extract_recommendations(
 
     try:
         raw = await call_llm(
-            "Buat 4 opsi skenario intervensi. Kembalikan HANYA array JSON berisi 4 string.",
+            "Generate 4 intervention scenario options. Return ONLY a JSON array of 4 strings.",
             prompt,
             max_tokens=450,
         )
@@ -1546,7 +1487,7 @@ async def _extract_recommendations(
     return _fallback_recs
 
 
-# ─── Scenario JSON system prompt ──────────────────────────────────────────────
+# Scenario JSON system prompt
 _SCENARIO_UPDATE_JSON_SYSTEM = """\
 You are a customer retention analytics engine. A multi-agent team has debated an intervention \
 scenario. Based on their analysis, produce a JSON update with ONLY these fields. \
@@ -1595,12 +1536,12 @@ def _clean_narrative(raw: str) -> str:
         return raw
     cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
     if cleaned:
-        return cleaned
-    return re.sub(r"</?think>", "", raw, flags=re.IGNORECASE).strip()
+        return _strip_markdown(cleaned)
+    result = re.sub(r"</?think>", "", raw, flags=re.IGNORECASE).strip()
+    return _strip_markdown(result)
 
 
-# ─── /simulate endpoint ───────────────────────────────────────────────────────
-
+# /simulate endpoint
 class SimulateRequest(BaseModel):
     customer_data:          _CustomerDataSim
     compare_customer_data:  _CustomerDataSim | None = None
@@ -1710,22 +1651,21 @@ async def simulate(request: SimulateRequest):
             system = agent_systems.get(name, "You are a customer success expert. Provide a brief analysis.")
             yield f"data: {json.dumps({'type': 'agent_start', 'agent': name, 'short': persona['short'], 'color': persona['color']})}\n\n"
             content = ""
-            async for token in stream_llm_no_think(system, agent_ctx, max_tokens=600):
+            async for token in stream_llm_no_think(system, agent_ctx, max_tokens=400):
                 content += token
                 yield f"data: {json.dumps({'type': 'agent_token', 'agent': name, 'content': token})}\n\n"
-            outputs.append({"name": name, "content": content})
+            outputs.append({"name": name, "content": _strip_markdown(content)})
             yield f"data: {json.dumps({'type': 'agent_done', 'agent': name})}\n\n"
         # store outputs in a closure-accessible list
         _run_agents._last_outputs = outputs  # type: ignore[attr-defined]
 
-    # ─────────────────────────────────────────────────────────────────────────
-    async def event_stream():
 
+    async def event_stream():
         # ══════════════════════════════════════════════════════════════════════
         # MODE: ask — Q&A about customer/results, no chart update
         # ══════════════════════════════════════════════════════════════════════
         if mode == "ask":
-            question = request.scenario.strip() or "Berikan ringkasan kondisi pelanggan ini."
+            question = request.scenario.strip() or "Provide a summary of this customer's situation."
             compare_note = ""
             if cc:
                 compare_note = (
@@ -1734,8 +1674,8 @@ async def simulate(request: SimulateRequest):
                 )
             ask_prompt = (
                 f"{ctx}{compare_note}{history_block}"
-                f"\n\nPERTANYAAN PENGGUNA: {question}"
-                + ("\n\nJawab dengan mempertimbangkan konteks KEDUA pelanggan jika relevan." if cc else "")
+                f"\n\nUSER QUESTION: {question}"
+                + ("\n\nAnswer considering the context of BOTH customers where relevant." if cc else "")
             )
             full_answer = ""
             async for token in stream_llm_no_think(_ASK_SYSTEM, ask_prompt, max_tokens=650):
@@ -1777,10 +1717,10 @@ async def simulate(request: SimulateRequest):
             last_pt   = baseline_pts[-1] if baseline_pts else {}
             agent_ctx = (
                 f"{ctx}{history_block}"
-                f"\n\nPROYEKSI ({horizon} minggu): churn {c.churn_score:.1f}% → "
-                f"{last_pt.get('prob', c.churn_score):.1f}% pada minggu ke-{horizon}. "
-                f"Revenue berisiko: ${sim_data.get('revenue_at_risk', 0):,.0f}."
-                f"\n\nBerikan analisis Anda."
+                f"\n\nFORECAST ({horizon} weeks): churn {c.churn_score:.1f}% → "
+                f"{last_pt.get('prob', c.churn_score):.1f}% at week {horizon}. "
+                f"Revenue at risk: ${sim_data.get('revenue_at_risk', 0):,.0f}."
+                f"\n\nProvide your analysis."
             )
             async for evt in _run_agents(agent_ctx, AGENT_ANALYZE_SYSTEMS):
                 yield evt
@@ -1827,13 +1767,13 @@ async def simulate(request: SimulateRequest):
                 )
             narrative_prompt = (
                 f"{ctx}{compare_ctx_note}{history_block}"
-                f"\n\nTrajektori churn ({horizon} minggu): "
-                f"minggu-0={c.churn_score:.1f}%, "
-                f"minggu-{last_pt.get('week', horizon)}={last_pt.get('prob', c.churn_score):.1f}%, "
-                f"window_retensi={sim_data.get('retention_window_weeks', '?')} minggu, "
-                f"revenue_berisiko=${sim_data.get('revenue_at_risk', 0):,.0f}."
+                f"\n\nChurn trajectory ({horizon} weeks): "
+                f"week 0={c.churn_score:.1f}%, "
+                f"week {last_pt.get('week', horizon)}={last_pt.get('prob', c.churn_score):.1f}%, "
+                f"retention_window={sim_data.get('retention_window_weeks', '?')} weeks, "
+                f"revenue_at_risk=${sim_data.get('revenue_at_risk', 0):,.0f}."
                 + (f" | Compare B churn: {cc.churn_score:.1f}% Risk: {cc.risk_level}" if cc else "")
-                + f"\n\nRINGKASAN ANALISIS TIM:\n{debate_text[:600]}"
+                + f"\n\nTEAM ANALYSIS SUMMARY:\n{debate_text[:600]}"
             )
             full_narrative = ""
             async for token in stream_llm(_SIM_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=700):
@@ -1846,14 +1786,14 @@ async def simulate(request: SimulateRequest):
         # ══════════════════════════════════════════════════════════════════════
         # MODE: scenario — 4 agents debate → projection JSON → narrative
         # ══════════════════════════════════════════════════════════════════════
-        scenario_block = f"\n\nSKENARIO INTERVENSI: {request.scenario}"
+        scenario_block = f"\n\nINTERVENTION SCENARIO: {request.scenario}"
         compare_note_s = ""
         if cc:
             compare_note_s = (
                 f"\n\nCOMPARE CUSTOMER B: {cc.customer_id} | Churn: {cc.churn_score:.1f}% | "
                 f"Risk: {cc.risk_level} | Segment: {cc.segment_label}"
             )
-        agent_ctx = f"{ctx}{compare_note_s}{scenario_block}{history_block}\n\nBerikan analisis Anda."
+        agent_ctx = f"{ctx}{compare_note_s}{scenario_block}{history_block}\n\nProvide your analysis."
 
         agent_outputs_s: list[dict] = []
         async for evt in _run_agents(agent_ctx, AGENT_SCENARIO_SYSTEMS):
@@ -1896,15 +1836,15 @@ async def simulate(request: SimulateRequest):
 
         debate_text = "\n\n".join(f"[{o['name']}]: {o['content']}" for o in agent_outputs_s)
         monthly_rev = c.segment_rfm_context.get("total_revenue", {}).get("customer", 0)
-        seg_note    = (f"Gunakan label segmen: {seg_lbls}" if seg_lbls
-                       else "Gunakan label standar: Churned, High Risk, At Risk, Retained")
+        seg_note    = (f"Use segment labels: {seg_lbls}" if seg_lbls
+                       else "Use standard labels: Churned, High Risk, At Risk, Retained")
 
         synth_user = (
             f"{ctx}{scenario_block}"
-            f"\n\nTITIK WAKTU BASELINE (minggu): {_fallback_points}"
-            f"\nREVENUE BULANAN: ${monthly_rev:,.0f}"
+            f"\n\nBASELINE TIME POINTS (weeks): {_fallback_points}"
+            f"\nMONTHLY REVENUE: ${monthly_rev:,.0f}"
             f"\n{seg_note}"
-            f"\n\nDEBAT MULTI-AGEN:\n{debate_text}"
+            f"\n\nMULTI-AGENT DEBATE:\n{debate_text}"
             f"\n\nGenerate the scenario update JSON now."
         )
 
@@ -1933,14 +1873,14 @@ async def simulate(request: SimulateRequest):
         proj_last = (update_data.get("projection") or [{}])[-1]
         compare_proj_note = ""
         if cc:
-            compare_proj_note = f"\n\nCOMPARE B: {cc.customer_id} churn {cc.churn_score:.1f}% ({cc.risk_level}) — skenario berlaku untuk kedua pelanggan."
+            compare_proj_note = f"\n\nCOMPARE B: {cc.customer_id} churn {cc.churn_score:.1f}% ({cc.risk_level}) — scenario applies to both customers."
         narrative_prompt = (
             f"{ctx}{scenario_block}{compare_proj_note}"
-            f"\n\nRINGKASAN DEBAT:\n{debate_text[:800]}"
-            f"\n\nHasil proyeksi: "
-            f"churn minggu-{proj_last.get('week', horizon)}={proj_last.get('prob', c.churn_score):.1f}%, "
-            f"dampak_intervensi={update_data.get('intervention_impact_pct', 0):.0f}pp pengurangan, "
-            f"revenue_berisiko=${update_data.get('revenue_at_risk', 0):,.0f}."
+            f"\n\nDEBATE SUMMARY:\n{debate_text[:800]}"
+            f"\n\nProjection result: "
+            f"churn week {proj_last.get('week', horizon)}={proj_last.get('prob', c.churn_score):.1f}%, "
+            f"intervention_impact={update_data.get('intervention_impact_pct', 0):.0f}pp reduction, "
+            f"revenue_at_risk=${update_data.get('revenue_at_risk', 0):,.0f}."
         )
         full_narrative = ""
         async for token in stream_llm(_SCENARIO_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=700):
