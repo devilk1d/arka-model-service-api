@@ -1410,7 +1410,7 @@ async def simulate(request: SimulateRequest):
                 
                 content = ""
                 # 2. Stream tokens into the queue
-                async for tok in stream_llm_no_think(system, agent_ctx, max_tokens=450):
+                async for tok in stream_llm_no_think(system, agent_ctx, max_tokens=1200):
                     content += tok
                     await queue.put({"type": "agent_token", "agent": name, "content": tok})
                 
@@ -1464,7 +1464,7 @@ async def simulate(request: SimulateRequest):
                 + ("\n\nConsider context of BOTH customers where relevant." if cc else "")
             )
             full_answer = ""
-            async for tok in stream_llm_no_think(_ASK_SYSTEM, ask_prompt, max_tokens=800):
+            async for tok in stream_llm_no_think(_ASK_SYSTEM, ask_prompt, max_tokens=1200):
                 full_answer += tok
                 yield f"data: {json.dumps({'type': 'token', 'content': tok})}\n\n"
             yield f"data: {json.dumps({'type': 'done', 'narrative': _clean_narrative(full_answer)})}\n\n"
