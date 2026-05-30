@@ -1323,22 +1323,19 @@ class _CustomerDataSim(BaseModel):
 
 
 class SimulateRequest(BaseModel):
-    customer_data:              _CustomerDataSim
-    compare_customer_data:      _CustomerDataSim | None = None
-    scenario:                   str        = ""
-    chat_history:               list[dict] = []
-    horizon_weeks:              int        = 12
-    segment_labels:             list[str]  = []
-    mode:                       str        = "initial"
-    current_segment_migration:  list | None = None
+    customer_data:             _CustomerDataSim
+    scenario:                  str        = ""
+    chat_history:              list[dict] = []
+    horizon_weeks:             int        = 12
+    segment_labels:            list[str]  = []
+    mode:                      str        = "initial"
+    current_segment_migration: list | None = None
 
 
 @app.post("/simulate")
 async def simulate(request: SimulateRequest):
     c        = request.customer_data
-    cc       = request.compare_customer_data
     ctx      = _build_ctx(c, "")
-    ctx_b    = _build_ctx(cc, "") if cc else ""
     horizon  = request.horizon_weeks
     seg_lbls = request.segment_labels or []
 
@@ -1460,16 +1457,7 @@ async def simulate(request: SimulateRequest):
         # ── MODE: ask ──────────────────────────────────────────────────────
         if mode == "ask":
             question = request.scenario.strip() or "Provide a summary of this customer's situation."
-            compare_note = ""
-            if cc:
-                compare_note = (
-                    f"\n\nCOMPARE CUSTOMER B: {cc.customer_id} | Churn: {cc.churn_score:.1f}% | "
-                    f"Risk: {cc.risk_level} | Segment: {cc.segment_label} | Plan: {cc.plan_type}"
-                )
-            ask_prompt = (
-                f"{ctx}{compare_note}{history_block}\n\nUSER QUESTION: {question}"
-                + ("\n\nConsider context of BOTH customers where relevant." if cc else "")
-            )
+            ask_prompt = f"{ctx}{history_block}\n\nUSER QUESTION: {question}"
             full_answer = ""
             async for tok in stream_llm_no_think(_ASK_SYSTEM, ask_prompt, max_tokens=1200):
                 full_answer += tok
@@ -1516,49 +1504,23 @@ async def simulate(request: SimulateRequest):
                 yield evt
             agent_outputs = getattr(_run_agents_parallel, "_last_outputs", [])
 
-            # Recommendations (primary + compare in parallel)
-            recs_tasks = [
-                _extract_recommendations(ctx, agent_outputs, scenario="",
-                    risk_level=c.risk_level, customer_profile={
-                        "segment_label": c.segment_label, "plan_type": c.plan_type,
-                        "contract_type": c.contract_type, "churn_score": c.churn_score,
-                        "shap_top5": c.shap_top5,
-                    }),
-            ]
-            if cc:
-                recs_tasks.append(
-                    _extract_recommendations(ctx_b, agent_outputs, scenario="",
-                        risk_level=cc.risk_level, customer_profile={
-                            "segment_label": cc.segment_label, "plan_type": cc.plan_type,
-                            "contract_type": cc.contract_type, "churn_score": cc.churn_score,
-                            "shap_top5": cc.shap_top5,
-                        }),
-                )
-            recs_results = await asyncio.gather(*recs_tasks)
-            recs         = recs_results[0]
-            compare_recs = recs_results[1] if cc else []
-
-            if recs or compare_recs:
-                evt_payload: dict = {"type": "agent_recommendations", "recommendations": recs}
-                if compare_recs:
-                    evt_payload["compare_recommendations"] = compare_recs
-                yield f"data: {json.dumps(evt_payload)}\n\n"
+            recs = await _extract_recommendations(ctx, agent_outputs, scenario="",
+                risk_level=c.risk_level, customer_profile={
+                    "segment_label": c.segment_label, "plan_type": c.plan_type,
+                    "contract_type": c.contract_type, "churn_score": c.churn_score,
+                    "shap_top5": c.shap_top5,
+                })
+            if recs:
+                yield f"data: {json.dumps({'type': 'agent_recommendations', 'recommendations': recs})}\n\n"
 
             debate_text = "\n".join(f"[{o['name']}]: {o['content'][:300]}" for o in agent_outputs)
-            compare_ctx_note = ""
-            if cc:
-                compare_ctx_note = (
-                    f"\n\nCOMPARE CUSTOMER B: {cc.customer_id} | Churn: {cc.churn_score:.1f}% | "
-                    f"Risk: {cc.risk_level} | Segment: {cc.segment_label}"
-                )
             narrative_prompt = (
-                f"{ctx}{compare_ctx_note}{history_block}"
+                f"{ctx}{history_block}"
                 f"\n\nChurn trajectory ({horizon} weeks): "
                 f"week 0={c.churn_score:.1f}%, week {last_pt.get('week', horizon)}="
                 f"{last_pt.get('prob', c.churn_score):.1f}%, "
                 f"retention_window={sim_data.get('retention_window_weeks', '?')} weeks, "
                 f"revenue_at_risk=${sim_data.get('revenue_at_risk', 0):,.0f}."
-                + (f" | Compare B: {cc.churn_score:.1f}% {cc.risk_level}" if cc else "")
                 + f"\n\nTEAM ANALYSIS:\n{debate_text[:600]}"
             )
             full_narrative = ""
@@ -1571,45 +1533,20 @@ async def simulate(request: SimulateRequest):
 
         # ── MODE: scenario ─────────────────────────────────────────────────
         scenario_block = f"\n\nINTERVENTION SCENARIO: {request.scenario}"
-        compare_note_s = ""
-        if cc:
-            compare_note_s = (
-                f"\n\nCOMPARE CUSTOMER B: {cc.customer_id} | Churn: {cc.churn_score:.1f}% | "
-                f"Risk: {cc.risk_level} | Segment: {cc.segment_label}"
-            )
-        agent_ctx = f"{ctx}{compare_note_s}{scenario_block}{history_block}\n\nProvide your analysis."
+        agent_ctx = f"{ctx}{scenario_block}{history_block}\n\nProvide your analysis."
 
         async for evt in _run_agents_parallel(agent_ctx, AGENT_SCENARIO_SYSTEMS):
             yield evt
         agent_outputs_s = getattr(_run_agents_parallel, "_last_outputs", [])
 
-        # Recommendations (primary + compare in parallel)
-        recs_s_tasks = [
-            _extract_recommendations(ctx, agent_outputs_s, scenario=request.scenario,
-                risk_level=c.risk_level, customer_profile={
-                    "segment_label": c.segment_label, "plan_type": c.plan_type,
-                    "contract_type": c.contract_type, "churn_score": c.churn_score,
-                    "shap_top5": c.shap_top5,
-                }),
-        ]
-        if cc:
-            recs_s_tasks.append(
-                _extract_recommendations(ctx_b, agent_outputs_s, scenario=request.scenario,
-                    risk_level=cc.risk_level, customer_profile={
-                        "segment_label": cc.segment_label, "plan_type": cc.plan_type,
-                        "contract_type": cc.contract_type, "churn_score": cc.churn_score,
-                        "shap_top5": cc.shap_top5,
-                    }),
-            )
-        recs_s_results  = await asyncio.gather(*recs_s_tasks)
-        recs_s          = recs_s_results[0]
-        compare_recs_s  = recs_s_results[1] if cc else []
-
-        if recs_s or compare_recs_s:
-            evt_s: dict = {"type": "agent_recommendations", "recommendations": recs_s}
-            if compare_recs_s:
-                evt_s["compare_recommendations"] = compare_recs_s
-            yield f"data: {json.dumps(evt_s)}\n\n"
+        recs_s = await _extract_recommendations(ctx, agent_outputs_s, scenario=request.scenario,
+            risk_level=c.risk_level, customer_profile={
+                "segment_label": c.segment_label, "plan_type": c.plan_type,
+                "contract_type": c.contract_type, "churn_score": c.churn_score,
+                "shap_top5": c.shap_top5,
+            })
+        if recs_s:
+            yield f"data: {json.dumps({'type': 'agent_recommendations', 'recommendations': recs_s})}\n\n"
 
         yield f"data: {json.dumps({'type': 'thinking'})}\n\n"
 
@@ -1699,15 +1636,9 @@ async def simulate(request: SimulateRequest):
 
         yield f"data: {json.dumps({'type': 'data', 'payload': update_data})}\n\n"
 
-        proj_last         = (update_data.get("projection") or [{}])[-1]
-        compare_proj_note = ""
-        if cc:
-            compare_proj_note = (
-                f"\n\nCOMPARE B: {cc.customer_id} churn {cc.churn_score:.1f}% ({cc.risk_level})"
-                f" — scenario applies to both customers."
-            )
+        proj_last = (update_data.get("projection") or [{}])[-1]
         narrative_prompt = (
-            f"{ctx}{scenario_block}{compare_proj_note}"
+            f"{ctx}{scenario_block}"
             f"\n\nDEBATE SUMMARY:\n{debate_text[:800]}"
             f"\n\nProjection: churn week {proj_last.get('week', horizon)}="
             f"{proj_last.get('prob', c.churn_score):.1f}%, "
