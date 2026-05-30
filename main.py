@@ -948,7 +948,8 @@ Rules:
 - projection[0].prob MUST equal the customer's current churn_score exactly.
 - projection values must generally be LOWER than baseline (intervention reduces churn).
 - intervention_impact_pct = baseline_final - projection_final (positive number).
-- segment_migration probs must sum to 1.0.
+- segment_migration MUST reflect the intervention effect: shift probability AWAY from high-risk/churned labels and TOWARD retained/loyal labels compared to what the baseline implied. The change must be visible (at least 5-15pp shift across labels). Use the SAME label names as provided in the context.
+- segment_migration probs must sum to exactly 1.0.
 - Match the same weekly time-points as the baseline.
 - Output ONLY the JSON object.
 """
@@ -1317,13 +1318,14 @@ class _CustomerDataSim(BaseModel):
 
 
 class SimulateRequest(BaseModel):
-    customer_data:         _CustomerDataSim
-    compare_customer_data: _CustomerDataSim | None = None
-    scenario:              str        = ""
-    chat_history:          list[dict] = []
-    horizon_weeks:         int        = 12
-    segment_labels:        list[str]  = []
-    mode:                  str        = "initial"
+    customer_data:              _CustomerDataSim
+    compare_customer_data:      _CustomerDataSim | None = None
+    scenario:                   str        = ""
+    chat_history:               list[dict] = []
+    horizon_weeks:              int        = 12
+    segment_labels:             list[str]  = []
+    mode:                       str        = "initial"
+    current_segment_migration:  list | None = None
 
 
 @app.post("/simulate")
@@ -1611,11 +1613,24 @@ async def simulate(request: SimulateRequest):
         seg_note    = (f"Use segment labels: {seg_lbls}" if seg_lbls
                        else "Use standard labels: Churned, High Risk, At Risk, Retained")
 
+        # Include current baseline segment migration so LLM knows what to shift from
+        baseline_seg_note = ""
+        if request.current_segment_migration:
+            seg_lines = ", ".join(
+                f"{s['label']}={round(s['prob']*100)}%"
+                for s in request.current_segment_migration
+                if isinstance(s, dict)
+            )
+            baseline_seg_note = (
+                f"\nBASELINE SEGMENT MIGRATION (pre-intervention): {seg_lines}"
+                f"\nYou MUST shift these probabilities — reduce churn/high-risk by 8-20pp, increase retained/loyal by same amount."
+            )
+
         synth_user = (
             f"{ctx}{scenario_block}"
             f"\n\nBASELINE TIME POINTS (weeks): {_fallback_points}"
             f"\nMONTHLY REVENUE: ${monthly_rev:,.0f}"
-            f"\n{seg_note}"
+            f"\n{seg_note}{baseline_seg_note}"
             f"\n\nMULTI-AGENT DEBATE:\n{debate_text}"
             f"\n\nGenerate the scenario update JSON now."
         )
@@ -1627,6 +1642,42 @@ async def simulate(request: SimulateRequest):
             if update_data.get("projection"):
                 update_data["projection"][0]["prob"] = round(c.churn_score, 2)
         except Exception as exc:
+            # Build a fallback segment_migration shifted toward retention
+            _cur_seg = request.current_segment_migration or []
+            if _cur_seg and len(_cur_seg) >= 2:
+                # Shift 15pp from churn/high-risk labels toward retained/loyal labels
+                _shift    = 0.15
+                _churn_kw = {"churned", "risk", "critical", "danger", "high"}
+                _keep_kw  = {"retained", "loyal", "champion", "stable", "active"}
+                _new_seg  = []
+                _total    = sum(s.get("prob", 0) for s in _cur_seg) or 1.0
+                for s in _cur_seg:
+                    lbl  = str(s.get("label", "")).lower()
+                    prob = s.get("prob", 0) / _total
+                    if any(k in lbl for k in _churn_kw):
+                        prob = max(0.02, prob - _shift / len(_cur_seg) * 2)
+                    elif any(k in lbl for k in _keep_kw):
+                        prob = min(0.95, prob + _shift / len(_cur_seg) * 2)
+                    _new_seg.append({"label": s["label"], "prob": round(prob, 3)})
+                _norm = sum(x["prob"] for x in _new_seg) or 1
+                _fallback_seg_mig = [{"label": x["label"], "prob": round(x["prob"] / _norm, 3)} for x in _new_seg]
+            elif seg_lbls and len(seg_lbls) >= 2:
+                n = len(seg_lbls)
+                base = c.churn_score / 100
+                probs = [max(0.02, base * 0.5 / max(n-1,1) * (n-1-i) + (1-base) * 0.4 / max(n-1,1) * i) for i in range(n)]
+                tot = sum(probs) or 1
+                _fallback_seg_mig = [{"label": seg_lbls[i], "prob": round(probs[i]/tot, 3)} for i in range(n)]
+            else:
+                base = c.churn_score / 100
+                _fallback_seg_mig = [
+                    {"label": "Churned",   "prob": round(max(0.02, base * 0.45), 3)},
+                    {"label": "High Risk", "prob": round(base * 0.15, 3)},
+                    {"label": "At Risk",   "prob": round((1-base) * 0.35, 3)},
+                    {"label": "Retained",  "prob": round((1-base) * 0.60, 3)},
+                ]
+                _tot = sum(x["prob"] for x in _fallback_seg_mig) or 1
+                _fallback_seg_mig = [{"label": x["label"], "prob": round(x["prob"]/_tot, 3)} for x in _fallback_seg_mig]
+
             update_data = {
                 "projection": [
                     {"week": w, "prob": round(min(100, c.churn_score * (0.70 ** (1 + i * 0.15))), 2)}
@@ -1636,6 +1687,7 @@ async def simulate(request: SimulateRequest):
                 "confidence":              0.55,
                 "retention_window_weeks":  min(horizon + 1, 8),
                 "revenue_at_risk":         round(monthly_rev * (c.churn_score * 0.65 / 100) * 3, 2),
+                "segment_migration":       _fallback_seg_mig,
                 "_error": str(exc)[:120],
             }
             update_data["projection"][0]["prob"] = round(c.churn_score, 2)
