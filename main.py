@@ -1358,7 +1358,10 @@ async def predict_single(
     for df in [ca_df, um_df, bd_df, st_df, nps_df]:
         df.drop(df[df["customer_id"] != customer_id].index, inplace=True)
 
-    results = run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df)
+    try:
+        results = run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Pipeline error: {e}")
     r = results[0]
 
     # ── All 3 XAI calls in parallel ─────────────────────────────────────────
