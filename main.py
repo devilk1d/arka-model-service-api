@@ -126,15 +126,44 @@ def _strip_markdown(text: str) -> str:
     return re.sub(r'\*{1,3}', '', text).strip()
 
 
+_FEATURE_LABEL_MAP = {
+    "vader_compound":            "Overall Sentiment Tone",
+    "vader_neg":                 "Negative Feedback Intensity",
+    "vader_pos":                 "Positive Feedback Intensity",
+    "vader_neu":                 "Neutral Feedback Level",
+    "vader_min_sent":            "Lowest Sentiment Moment",
+    "vader_std_sent":            "Sentiment Consistency",
+    "pct_neg_sent":              "Negative Feedback Percentage",
+    "pct_negative_sent":         "Negative Feedback Percentage",
+    "urgency_score":             "Urgency Level in Feedback",
+    "avg_dissatisfaction_proba": "Customer Dissatisfaction Score",
+    "dissatisfaction_proba":     "Customer Dissatisfaction Score",
+    "ling_churn_intent":         "Churn Intent Signals in Feedback",
+    "ling_contrast":             "Mixed or Contradictory Feedback",
+    "ling_word_count":           "Feedback Engagement Volume",
+    "log_total_revenue":         "Total Revenue",
+    "log_monthly_usage_hrs":     "Monthly Usage Hours",
+    "log_total_tickets":         "Total Support Tickets",
+    "log_total_users":           "Total Users",
+    "dunning_per_tenure":        "Late Payment Rate Over Time",
+    "usage_per_user":            "Usage Hours Per User",
+    "ticket_per_revenue":        "Support Ticket Burden per Revenue",
+    "adoption_x_usage":          "Feature Adoption and Usage Combined",
+    "nps_x_dunning":             "Satisfaction vs. Payment Risk",
+    "revenue_per_month":         "Monthly Revenue",
+    "payments_per_month":        "Payment Frequency",
+}
+
+
 def get_top_shap(shap_row: pd.Series, top_n: int = 5) -> list:
     top = shap_row.abs().nlargest(top_n)
     return [
         {
             "feature":       k,
-            "shap_value":    round(float(shap_row[k]), 4),
-            "direction":     "increases_churn" if shap_row[k] > 0 else "decreases_churn",
+            "impact_score":  round(float(shap_row[k]), 4),
+            "direction":     "raises_risk" if shap_row[k] > 0 else "lowers_risk",
             "importance":    round(abs(float(shap_row[k])), 4),
-            "feature_label": k.replace("_", " ").title(),
+            "feature_label": _FEATURE_LABEL_MAP.get(k, k.replace("_", " ").title()),
         }
         for k in top.index
     ]
@@ -518,9 +547,8 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
             "sentiment": {
                 "label":                 row["sentiment_label"],
                 "dissatisfaction_score": round(float(row["dissatisfaction_proba"]), 4),
-                "vader_compound":        round(float(row["vader_compound"]), 4),
-                "vader_neg":             round(float(row["vader_neg"]), 4),
-                "pct_negative_sent":     round(float(row["pct_negative_sent"]) * 100, 1),
+                "tone_score":            round(float(row["vader_compound"]), 4),
+                "negative_feedback_pct": round(float(row["pct_negative_sent"]) * 100, 1),
                 "urgency_level":         row["urgency_level"],
                 "urgency_score":         int(row["urgency_score"]),
                 "dominant_topic":        row["dominant_topic_label"],
@@ -566,7 +594,7 @@ async def call_llm(system: str, user_msg: str, max_tokens: int = 1200) -> str:
         return resp.json()["choices"][0]["message"]["content"]
 
 
-async def _call_llm_xai(prompt: str) -> str:
+async def _call_llm_xai(prompt: str, max_tokens: int = 2000) -> str:
     """XAI/JSON mode LLM call. Returns raw JSON string — do NOT strip markdown here."""
     raw_url = os.getenv("OLLAMA_URL", "https://api.openai.com/v1")
     if not raw_url.startswith("http"):
@@ -589,14 +617,14 @@ async def _call_llm_xai(prompt: str) -> str:
             "messages": [{"role": "user", "content": prompt}],
             "stream":   False,
             "format":   "json",
-            "options":  {"temperature": 0.2, "num_predict": 1500},
+            "options":  {"temperature": 0.2, "num_predict": max_tokens},
         }
     else:
         endpoint = f"{base_url}/chat/completions"
         payload  = {
             "model":       LLM_MODEL,
             "messages":    [{"role": "user", "content": prompt}],
-            "max_tokens":  1500,
+            "max_tokens":  max_tokens,
             "temperature": 0.2,
             "response_format": {"type": "json_object"},
         }
@@ -721,10 +749,10 @@ def _clean_narrative(raw: str) -> str:
 
 # ─── LLM prompt builders ──────────────────────────────────────────────────────
 def build_churn_xai_prompt(r: dict) -> str:
-    shap_lines = "\n".join([
+    risk_lines = "\n".join([
         f"  {idx+1}. {f['feature_label']} "
-        f"({'increases' if f['direction'] == 'increases_churn' else 'decreases'} churn risk, "
-        f"SHAP: {f['shap_value']:+.3f})"
+        f"({'increases' if f.get('direction', '') in ('raises_risk', 'increases_churn') else 'decreases'} churn risk, "
+        f"impact: {f.get('impact_score', f.get('shap_value', 0)):+.3f})"
         for idx, f in enumerate(r["shap_top5"])
     ])
     sent     = r["sentiment"]
@@ -734,6 +762,7 @@ def build_churn_xai_prompt(r: dict) -> str:
     adoption = rfm.get("feature_adoption_pct", {}).get("customer", 0)
     nps      = rfm.get("avg_nps_score",        {}).get("customer", 0)
     tenure   = rfm.get("days_since_login",     {}).get("customer", 0)
+    tone     = sent.get("tone_score", sent.get("vader_compound", 0))
 
     feedback_items = sent.get("feedback_texts", [])
     feedback_str   = " | ".join(feedback_items[:5]) if feedback_items else "No feedback available"
@@ -745,20 +774,20 @@ Churn Score: {r['churn_score']}/100 | Risk: {r['risk_level']}
 Revenue: ${revenue:,.0f}/mo | Usage: {usage:.0f}h/mo | Feature Adoption: {adoption:.0f}% | NPS: {nps:.1f}/10
 Days since last login: {tenure:.0f}
 
-TOP CHURN FACTORS (SHAP):
-{shap_lines}
+TOP RISK FACTORS:
+{risk_lines}
 
-SENTIMENT: {sent['label']} | VADER: {sent['vader_compound']:+.3f} | Urgency: {sent['urgency_level']} | Topic: {sent['dominant_topic']}
+SENTIMENT: {sent['label']} | Tone score: {tone:+.3f} | Urgency: {sent['urgency_level']} | Topic: {sent['dominant_topic']}
 Feedback: "{feedback_str[:400]}"
 
 Rules for your JSON values:
-- score_reason: Write 3–6 clear and meaningful sentences explaining why this score was given. Use the actual numerical values, metrics, or indicators in the explanation. Highlight the most important contributing factors, describe their impact briefly, and make the reasoning specific, insightful, and easy to understand. Avoid generic statements or repetition.
-- risk_factors: exactly 3 short phrases, max 8 words each, one per top SHAP driver.
-- feedback_signal: 1 plain sentence summarizing the customer complaint.
-- retain: exactly 3 short action items, max 12 words each, specific to this customer.
-- offer: exactly 3 short offer items, max 12 words each, specific to this plan and revenue.
-- reason: 1 plain sentence explaining the logic.
-No asterisks, no bold, no markdown anywhere.
+- score_reason: Write 3-4 sentences explaining why this churn risk score was assigned. Reference actual numbers and business metrics. Explain what each factor means for this account in plain business terms. Be specific and avoid generic statements.
+- risk_factors: exactly 3 short phrases (max 8 words each) describing the top business risk signals in plain business language.
+- feedback_signal: 1 plain sentence summarizing the main customer concern from their feedback.
+- retain: exactly 3 specific action items (max 12 words each) tailored to this customer's situation.
+- offer: exactly 3 specific offer items (max 12 words each) tailored to this plan and revenue level.
+- reason: 1 plain sentence explaining the retention logic.
+No asterisks, no bold, no markdown, no technical terms (such as SHAP, VADER, model names, or machine learning jargon) anywhere in any field.
 
 Reply with this exact JSON structure:
 {{"score_reason":"...","risk_factors":["...","...","..."],"feedback_signal":"...","action":{{"retain":["...","...","..."],"offer":["...","...","..."],"reason":"..."}}}}"""
@@ -774,6 +803,7 @@ def build_segment_xai_prompt(r: dict) -> str:
         for k, v in rfm.items()
     ])
 
+    tone = sent.get("tone_score", sent.get("vader_compound", 0))
     return f"""You are a senior customer success analyst. Reply ONLY with valid JSON — no prose, no markdown fences.
 
 CUSTOMER: {r['customer_id']} | Plan: {r['plan_type']} ({r['contract_type']})
@@ -787,9 +817,9 @@ Customers: {seg_prof.get('count', 'N/A')} | Avg churn score: {seg_prof.get('avg_
 % High risk: {seg_prof.get('pct_high_risk', 'N/A')}% | Avg tenure: {seg_prof.get('avg_tenure_days', 'N/A')} days
 Description: {seg_act.get('description', '')}
 
-SENTIMENT: {sent['label']} (VADER: {sent['vader_compound']:+.3f}) | Topic: {sent['dominant_topic']} | Urgency: {sent['urgency_level']}
+SENTIMENT: {sent['label']} (Tone: {tone:+.3f}) | Topic: {sent['dominant_topic']} | Urgency: {sent['urgency_level']}
 
-No asterisks, no bold, no markdown in any value.
+No asterisks, no bold, no markdown, no technical terms (SHAP, VADER, model names, ML jargon) in any value. Use plain business language only.
 
 Reply with this exact JSON:
 {{"segment_reason":"1-2 plain sentences why this customer belongs in this segment","characteristics":["short trait 1","short trait 2","short trait 3"],"watch_out":"1 plain sentence about the main concern","strategy":"1 plain sentence about the best action"}}"""
@@ -827,13 +857,13 @@ _SIM_NARRATIVE_SYSTEM = """\
 You are a senior customer success analyst at a SaaS company.
 Write EXACTLY 4 short paragraphs (2-3 sentences each) in plain English.
 
-Paragraph 1: Current churn risk — state the score, the top SHAP factors with their values, and what this means for the account.
-Paragraph 2: Trajectory forecast — where the churn probability is heading and the key drivers.
+Paragraph 1: Current churn risk — state the score, the top business risk factors with their significance, and what this means for the account.
+Paragraph 2: Trajectory forecast — where the churn probability is heading and the key business drivers.
 Paragraph 3: Retention window and financial exposure — how much time is left and how much revenue is at risk.
 Paragraph 4: The single most urgent action with a concrete timeline and expected outcome.
 
 Separate each paragraph with one blank line.
-No bullet points. No headers. No markdown. No asterisks. Write directly without any opening phrase.
+No bullet points. No headers. No markdown. No asterisks. No technical terms (SHAP, VADER, model names, ML jargon). Write directly without any opening phrase.
 """
 
 _SCENARIO_NARRATIVE_SYSTEM = """\
@@ -892,26 +922,30 @@ AGENT_ANALYZE_SYSTEMS: dict[str, str] = {
     "Risk Analyst": (
         "You are a Churn Risk Analyst at a SaaS company. "
         "Give 4-5 bullet points using - (hyphen). One short, clear sentence per point. No asterisks or bold.\n"
-        "Cover: most critical SHAP risk factor with its value, what is driving churn up, "
-        "one trend to watch, and one specific action to reduce risk. Use actual numbers."
+        "Cover: the most critical business risk signal with its measured value, what behavioral pattern is driving churn, "
+        "one trend to watch, and one specific action to reduce risk. Use actual numbers. "
+        "Do not mention SHAP, VADER, or any technical ML/AI model names."
     ),
     "Customer Success": (
         "You are a Customer Success Manager at a SaaS company. "
         "Give 4-5 bullet points using - (hyphen). One short, clear sentence per point. No asterisks or bold.\n"
         "Cover: root cause of disengagement or dissatisfaction, key engagement signal, "
-        "current sentiment summary, and one specific outreach action for this week."
+        "current customer sentiment summary in plain language, and one specific outreach action for this week. "
+        "Do not mention SHAP, VADER, or any technical ML/AI model names."
     ),
     "Finance Analyst": (
         "You are a Finance Analyst at a SaaS company. "
         "Give 4-5 bullet points using - (hyphen). One short, clear sentence per point. No asterisks or bold.\n"
         "Cover: estimated revenue loss if churned, customer value vs segment average, "
-        "economic case for retention, and one cost-effective offer with a concrete value."
+        "economic case for retention, and one cost-effective offer with a concrete value. "
+        "Do not mention SHAP, VADER, or any technical ML/AI model names."
     ),
     "Product Manager": (
         "You are a Product Manager at a SaaS company. "
         "Give 4-5 bullet points using - (hyphen). One short, clear sentence per point. No asterisks or bold.\n"
         "Cover: biggest feature adoption gap driving churn, concerning usage pattern, "
-        "most relevant unused feature, and one specific product action to close the gap."
+        "most relevant unused feature, and one specific product action to close the gap. "
+        "Do not mention SHAP, VADER, or any technical ML/AI model names."
     ),
 }
 
@@ -919,26 +953,30 @@ AGENT_SCENARIO_SYSTEMS: dict[str, str] = {
     "Risk Analyst": (
         "You are a Churn Risk Analyst at a SaaS company. "
         "Analyze the proposed intervention. Give 4-5 bullet points using - (hyphen). One short, clear sentence per point. No asterisks or bold.\n"
-        "Cover: estimated churn reduction in percentage points, which risk factor is most affected, "
-        "residual risk if it fails, and confidence level in this intervention."
+        "Cover: estimated churn reduction in percentage points, which business risk factor is most affected, "
+        "residual risk if it fails, and confidence level in this intervention. "
+        "Do not mention SHAP, VADER, or any technical ML/AI model names."
     ),
     "Customer Success": (
         "You are a Customer Success Manager at a SaaS company. "
         "Analyze the proposed intervention. Give 4-5 bullet points using - (hyphen). One short, clear sentence per point. No asterisks or bold.\n"
         "Cover: whether it addresses the real root cause, what supports or blocks success, "
-        "what must accompany it, and a realistic execution timeline."
+        "what must accompany it, and a realistic execution timeline. "
+        "Do not mention SHAP, VADER, or any technical ML/AI model names."
     ),
     "Finance Analyst": (
         "You are a Finance Analyst at a SaaS company. "
         "Analyze the proposed intervention. Give 4-5 bullet points using - (hyphen). One short, clear sentence per point. No asterisks or bold.\n"
         "Cover: intervention cost vs revenue at risk, ROI with concrete numbers, "
-        "break-even point, and your financial recommendation."
+        "break-even point, and your financial recommendation. "
+        "Do not mention SHAP, VADER, or any technical ML/AI model names."
     ),
     "Product Manager": (
         "You are a Product Manager at a SaaS company. "
         "Analyze the proposed intervention. Give 4-5 bullet points using - (hyphen). One short, clear sentence per point. No asterisks or bold.\n"
         "Cover: impact on feature adoption and engagement, most relevant feature for this intervention, "
-        "product change that strengthens the outcome, and the key metric to monitor."
+        "product change that strengthens the outcome, and the key metric to monitor. "
+        "Do not mention SHAP, VADER, or any technical ML/AI model names."
     ),
 }
 
@@ -1031,9 +1069,9 @@ Rules:
 
 def _build_ctx(c, scenario: str) -> str:
     rfm      = c.segment_rfm_context
-    shap_txt = "\n".join(
-        f"  - {f['feature_label']}: {f['shap_value']:+.3f} "
-        f"({'increases' if f['direction'] == 'increases_churn' else 'decreases'} risk)"
+    risk_txt = "\n".join(
+        f"  - {f['feature_label']}: {f.get('impact_score', f.get('shap_value', 0)):+.3f} "
+        f"({'increases' if f.get('direction', '') in ('raises_risk', 'increases_churn') else 'decreases'} risk)"
         for f in c.shap_top5
     )
     rev      = rfm.get("total_revenue",       {}).get("customer", 0)
@@ -1041,6 +1079,7 @@ def _build_ctx(c, scenario: str) -> str:
     adoption = rfm.get("feature_adoption_pct", {}).get("customer", 0)
     nps      = rfm.get("avg_nps_score",        {}).get("customer", 0)
     dsl      = rfm.get("days_since_login",     {}).get("customer", 0)
+    tone     = c.sentiment.get("tone_score", c.sentiment.get("vader_compound", 0))
 
     feedback_items   = c.sentiment.get("feedback_texts", [])
     feedback_preview = feedback_items[0][:150] if feedback_items else "No feedback"
@@ -1051,10 +1090,10 @@ def _build_ctx(c, scenario: str) -> str:
         f"Revenue: ${rev:,.0f}/mo | Usage: {usage:.0f}h/mo | Adoption: {adoption:.0f}% | NPS: {nps:.1f}/10\n"
         f"Days since last login: {dsl:.0f}\n"
         f"Sentiment: {c.sentiment.get('label', 'N/A')} "
-        f"(VADER: {c.sentiment.get('vader_compound', 0):+.3f}) | "
+        f"(Tone: {tone:+.3f}) | "
         f"Urgency: {c.sentiment.get('urgency_level', 'N/A')}\n"
         f"Feedback: \"{feedback_preview}\"\n\n"
-        f"TOP CHURN DRIVERS (SHAP):\n{shap_txt}"
+        f"TOP RISK FACTORS:\n{risk_txt}"
     )
     if scenario.strip():
         ctx += f"\n\nINTERVENTION SCENARIO:\n{scenario}"
@@ -1091,7 +1130,7 @@ def _build_contextual_fallback(risk_lvl: str, customer_profile: dict, scenario: 
 
     for factor in shap5[:3]:
         label  = str(factor.get("feature_label", "")).lower()
-        shap_v = float(factor.get("shap_value", 0))
+        shap_v = float(factor.get("impact_score", factor.get("shap_value", 0)))
         if shap_v <= 0:
             continue
         for key, action in _FACTOR_ACTIONS.items():
@@ -1299,29 +1338,27 @@ async def predict(
 
         await asyncio.gather(*[_xai_one(r) for r in results])
 
-        # ── Per-segment cohort narratives (one LLM call per segment) ────────
-        seen_segs: set[str]       = set()
-        seg_cohort: dict[str, str] = {}
-
-        async def _cohort_one(r: dict) -> None:
+        # ── Per-segment cohort narratives — parallel across unique segments ──
+        unique_seg_rows: dict[str, dict] = {}
+        for r in results:
             seg = r["segment_label"]
-            if seg in seen_segs:
-                return
-            seen_segs.add(seg)
-            seg_cohort[seg] = await _call_llm_xai(
+            if seg not in unique_seg_rows:
+                unique_seg_rows[seg] = r
+
+        async def _cohort_for(seg: str, row: dict) -> tuple[str, str]:
+            return seg, await _call_llm_xai(
                 build_segment_cohort_prompt(
                     seg_label       = seg,
-                    seg_prof        = r["segment_profile"],
-                    seg_desc        = r["segment_actions"].get("description", ""),
-                    retain_actions  = r["segment_actions"].get("retain", []),
-                    offer_actions   = r["segment_actions"].get("offer", []),
+                    seg_prof        = row["segment_profile"],
+                    seg_desc        = row["segment_actions"].get("description", ""),
+                    retain_actions  = row["segment_actions"].get("retain", []),
+                    offer_actions   = row["segment_actions"].get("offer", []),
                     total_customers = len(results),
                 )
             )
 
-        # Process cohorts sequentially to avoid racing on seen_segs
-        for r in results:
-            await _cohort_one(r)
+        cohort_pairs = await asyncio.gather(*[_cohort_for(seg, row) for seg, row in unique_seg_rows.items()])
+        seg_cohort   = dict(cohort_pairs)
 
         for r in results:
             r["xai_segment_cohort"] = seg_cohort.get(r["segment_label"])
