@@ -77,10 +77,50 @@ if EXPLAINER is None:
 
 ANALYZER = SentimentIntensityAnalyzer()
 
-LLM_URL      = os.getenv("OLLAMA_URL",      "https://api.ollama.ai/v1")
-LLM_KEY      = os.getenv("OLLAMA_API_KEY",  "")
-LLM_MODEL    = os.getenv("OLLAMA_MODEL",    "qwen3.5:397b-cloud")
 FUSION_ALPHA = float(os.getenv("FUSION_ALPHA", "1.0"))
+
+# ─── LLM providers: Groq primary, Ollama fallback ──────────────────────────────
+def _clean_base_url(raw: str) -> str:
+    if not raw.startswith("http"):
+        raw = f"https://{raw}"
+    return raw.rstrip("/")
+
+# Primary: Groq (OpenAI-compatible, very high tokens/sec)
+GROQ_URL   = _clean_base_url(os.getenv("GROQ_URL", "https://api.groq.com/openai/v1"))
+GROQ_KEY   = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+# Fallback: Ollama Cloud (existing setup)
+OLLAMA_URL   = _clean_base_url(os.getenv("OLLAMA_URL", "https://ollama.com/v1"))
+OLLAMA_KEY   = os.getenv("OLLAMA_API_KEY", "")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:120b-cloud")
+
+def _build_providers() -> list[dict]:
+    """Ordered provider list. Groq first when a key is set, Ollama as fallback."""
+    provs: list[dict] = []
+    if GROQ_KEY:
+        provs.append({
+            "name": "groq", "base": GROQ_URL, "key": GROQ_KEY, "model": GROQ_MODEL,
+            "native_ollama": False,
+            "extra": {},
+        })
+    provs.append({
+        "name": "ollama", "base": OLLAMA_URL, "key": OLLAMA_KEY, "model": OLLAMA_MODEL,
+        "native_ollama": ("localhost" in OLLAMA_URL or "127.0.0.1" in OLLAMA_URL
+                          or OLLAMA_URL.endswith("/api")),
+        "extra": {},
+    })
+    return provs
+
+
+PROVIDERS = _build_providers()
+
+
+def _provider_headers(p: dict) -> dict:
+    headers = {"Content-Type": "application/json"}
+    if p.get("key"):
+        headers["Authorization"] = f"Bearer {p['key']}"
+    return headers
 
 print("✅ Artifacts loaded (v6 — GradientBoosting, 38 features, no calibration)")
 print(f"   model_version : {A.get('model_version', 'unknown')}")
@@ -92,6 +132,7 @@ print(f"   RISK_LOW/HIGH : {RISK_LOW} / {RISK_HIGH}")
 print(f"   N_TOPICS      : {N_TOPICS}")
 print(f"✅ NLP Artifacts loaded (sentiment: TF-IDF + LightGBM, 4-tier)")
 print(f"   nlp_auc_cv    : {NLP.get('nlp_auc_cv', 'unknown')}")
+print("✅ LLM providers : " + " → ".join(f"{p['name']}({p['model']})" for p in PROVIDERS))
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 def risk_level(score: float) -> str:
@@ -567,123 +608,131 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
 
 
 # ─── LLM helpers ──────────────────────────────────────────────────────────────
-def _get_llm_endpoint() -> tuple[str, dict]:
-    raw = os.getenv("OLLAMA_URL", "https://api.openai.com/v1")
-    if not raw.startswith("http"):
-        raw = f"https://{raw}"
-    base = raw.rstrip("/")
-    headers = {"Content-Type": "application/json"}
-    if LLM_KEY:
-        headers["Authorization"] = f"Bearer {LLM_KEY}"
-    return base, headers
-
+# Each call tries providers in order (Groq → Ollama). Groq is the default; if a
+# request to it fails (HTTP error, timeout, connection issue) we fall back to
+# Ollama transparently so output is never lost.
 
 async def call_llm(system: str, user_msg: str, max_tokens: int = 1200) -> str:
-    """Non-streaming LLM call; returns the full response text."""
-    base, headers = _get_llm_endpoint()
-    payload = {
-        "model":       LLM_MODEL,
-        "messages":    [{"role": "system", "content": system}, {"role": "user", "content": user_msg}],
-        "stream":      False,
-        "temperature": 0.4,
-        "max_tokens":  max_tokens,
-    }
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(f"{base}/chat/completions", headers=headers, json=payload)
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+    """Non-streaming LLM call; returns the full response text. Groq → Ollama fallback."""
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user_msg}]
+    last_err = None
+    for p in PROVIDERS:
+        try:
+            payload = {
+                "model":       p["model"],
+                "messages":    messages,
+                "stream":      False,
+                "temperature": 0.4,
+                "max_tokens":  max_tokens,
+                **p.get("extra", {}),
+            }
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(f"{p['base']}/chat/completions",
+                                         headers=_provider_headers(p), json=payload)
+                resp.raise_for_status()
+                return resp.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"all LLM providers failed: {type(last_err).__name__}: {str(last_err)[:120]}")
 
 
 async def _call_llm_xai(prompt: str, max_tokens: int = 2000) -> str:
-    """XAI/JSON mode LLM call. Returns raw JSON string — do NOT strip markdown here."""
-    raw_url = os.getenv("OLLAMA_URL", "https://api.openai.com/v1")
-    if not raw_url.startswith("http"):
-        raw_url = f"https://{raw_url}"
-    base_url = raw_url.rstrip("/")
+    """XAI/JSON mode LLM call. Returns raw JSON string — do NOT strip markdown here.
+    Tries each provider (Groq → Ollama) until one returns content."""
+    last_err = None
+    for p in PROVIDERS:
+        try:
+            headers = _provider_headers(p)
+            if p["native_ollama"]:
+                endpoint = p["base"].replace("/v1", "").rstrip("/") + "/api/chat"
+                payload  = {
+                    "model":    p["model"],
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream":   False,
+                    "format":   "json",
+                    "options":  {"temperature": 0.2, "num_predict": max_tokens},
+                }
+            else:
+                endpoint = f"{p['base']}/chat/completions"
+                payload  = {
+                    "model":       p["model"],
+                    "messages":    [{"role": "user", "content": prompt}],
+                    "max_tokens":  max_tokens,
+                    "temperature": 0.2,
+                    "response_format": {"type": "json_object"},
+                    **p.get("extra", {}),
+                }
 
-    is_native_ollama = (
-        "localhost" in base_url or "127.0.0.1" in base_url
-        or base_url.rstrip("/").endswith("/api")
-    )
+            async with httpx.AsyncClient(timeout=90.0) as client:
+                resp = await client.post(endpoint, headers=headers, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
 
-    headers = {"Content-Type": "application/json"}
-    if LLM_KEY:
-        headers["Authorization"] = f"Bearer {LLM_KEY}"
+            if "choices" in data:
+                content = data["choices"][0]["message"]["content"]
+            elif "message" in data:
+                content = data["message"]["content"]
+            else:
+                last_err = f"unexpected response shape: {list(data.keys())}"
+                continue
 
-    if is_native_ollama:
-        endpoint = base_url.replace("/v1", "").rstrip("/") + "/api/chat"
-        payload  = {
-            "model":    LLM_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream":   False,
-            "format":   "json",
-            "options":  {"temperature": 0.2, "num_predict": max_tokens},
-        }
-    else:
-        endpoint = f"{base_url}/chat/completions"
-        payload  = {
-            "model":       LLM_MODEL,
-            "messages":    [{"role": "user", "content": prompt}],
-            "max_tokens":  max_tokens,
-            "temperature": 0.2,
-            "response_format": {"type": "json_object"},
-        }
+            # Strip think blocks only — do NOT apply _strip_markdown (would corrupt JSON keys)
+            content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+            content = re.sub(r"^```(?:json)?\s*", "", content).rstrip("```").strip()
+            return content
 
-    try:
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            resp = await client.post(endpoint, headers=headers, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
+        except Exception as e:
+            last_err = e
+            continue
 
-        if "choices" in data:
-            content = data["choices"][0]["message"]["content"]
-        elif "message" in data:
-            content = data["message"]["content"]
-        else:
-            return json.dumps({"error": f"unexpected response shape: {list(data.keys())}"})
-
-        # Strip think blocks only — do NOT apply _strip_markdown (would corrupt JSON keys)
-        content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-        content = re.sub(r"^```(?:json)?\s*", "", content).rstrip("```").strip()
-        return content
-
-    except httpx.ConnectError as e:
-        return json.dumps({"error": f"cannot connect to {endpoint}: {str(e)[:100]}"})
-    except httpx.HTTPStatusError as e:
-        return json.dumps({"error": f"HTTP {e.response.status_code} from {endpoint}"})
-    except Exception as e:
-        return json.dumps({"error": f"{type(e).__name__}: {str(e)[:100]}"})
+    return json.dumps({"error": f"all LLM providers failed: {str(last_err)[:100]}"})
 
 
 async def stream_llm(system: str, user_msg: str, max_tokens: int = 600):
-    """Stream tokens from LLM via OpenAI-compatible SSE."""
-    base, headers = _get_llm_endpoint()
-    payload = {
-        "model":       LLM_MODEL,
-        "messages":    [{"role": "system", "content": system}, {"role": "user", "content": user_msg}],
-        "stream":      True,
-        "temperature": 0.7,
-        "max_tokens":  max_tokens,
-    }
-    try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            async with client.stream("POST", f"{base}/chat/completions", headers=headers, json=payload) as resp:
-                resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    data = line[6:].strip()
-                    if data == "[DONE]":
-                        return
-                    try:
-                        obj   = json.loads(data)
-                        token = obj["choices"][0]["delta"].get("content", "")
-                        if token:
-                            yield token
-                    except (json.JSONDecodeError, KeyError, IndexError):
-                        pass
-    except Exception as exc:
-        yield f"[Error: {str(exc)[:80]}]"
+    """Stream tokens via OpenAI-compatible SSE. Falls back to the next provider
+    only if the current one fails BEFORE emitting any token (mid-stream failures
+    keep whatever was already streamed)."""
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user_msg}]
+    last_err = None
+    for p in PROVIDERS:
+        payload = {
+            "model":       p["model"],
+            "messages":    messages,
+            "stream":      True,
+            "temperature": 0.7,
+            "max_tokens":  max_tokens,
+            **p.get("extra", {}),
+        }
+        started = False
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                async with client.stream("POST", f"{p['base']}/chat/completions",
+                                         headers=_provider_headers(p), json=payload) as resp:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        data = line[6:].strip()
+                        if data == "[DONE]":
+                            return
+                        try:
+                            obj   = json.loads(data)
+                            token = obj["choices"][0]["delta"].get("content", "")
+                            if token:
+                                started = True
+                                yield token
+                        except (json.JSONDecodeError, KeyError, IndexError):
+                            pass
+            return  # provider finished cleanly
+        except Exception as exc:
+            last_err = exc
+            if started:
+                # Already streamed partial output — cannot safely restart elsewhere.
+                yield f"[Error: {str(exc)[:80]}]"
+                return
+            continue  # nothing emitted yet → try next provider
+    yield f"[Error: {str(last_err)[:80]}]"
 
 
 async def stream_llm_no_think(system: str, user_msg: str, max_tokens: int = 600):
@@ -868,14 +917,12 @@ No bullet points. No headers. No markdown. No asterisks. No technical terms (SHA
 
 _SCENARIO_NARRATIVE_SYSTEM = """\
 You are a senior customer success analyst at a SaaS company.
-Write EXACTLY 4 short paragraphs (2-3 sentences each) in plain English.
+Write EXACTLY 2 dense, information-rich paragraphs (3-4 sentences each) in plain English. Pack meaning into every sentence — no filler.
 
-Paragraph 1: What this scenario proposes and the projected change in churn probability (use specific numbers).
-Paragraph 2: The strongest reason why this intervention could succeed based on the customer data.
-Paragraph 3: The main risks — what could fail and what conditions must be met.
-Paragraph 4: Concrete next steps with a specific timeline and measurable success metrics.
+Paragraph 1: What this scenario proposes, the projected change in churn probability (use specific numbers), and the strongest data-backed reason it could succeed.
+Paragraph 2: The main risks and conditions for success, then the concrete next steps with a specific timeline and measurable success metrics.
 
-Separate each paragraph with one blank line.
+Separate the two paragraphs with one blank line.
 No bullet points. No headers. No markdown. No asterisks. Write directly without any opening phrase.
 """
 
