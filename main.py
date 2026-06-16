@@ -637,7 +637,7 @@ async def call_llm(system: str, user_msg: str, max_tokens: int = 1200) -> str:
     raise RuntimeError(f"all LLM providers failed: {type(last_err).__name__}: {str(last_err)[:120]}")
 
 
-async def _call_llm_xai(prompt: str, max_tokens: int = 2000) -> str:
+async def _call_llm_xai(prompt: str, max_tokens: int = 700) -> str:
     """XAI/JSON mode LLM call. Returns raw JSON string — do NOT strip markdown here.
     Tries each provider (Groq → Ollama) until one returns content."""
     last_err = None
@@ -904,14 +904,12 @@ Reply with this exact JSON (all 4 fields required):
 # ─── Narrative / agent system prompts ─────────────────────────────────────────
 _SIM_NARRATIVE_SYSTEM = """\
 You are a senior customer success analyst at a SaaS company.
-Write EXACTLY 4 short paragraphs (2-3 sentences each) in plain English.
+Write EXACTLY 2 dense, information-rich paragraphs (3-4 sentences each) in plain English. Pack meaning into every sentence — no filler.
 
-Paragraph 1: Current churn risk — state the score, the top business risk factors with their significance, and what this means for the account.
-Paragraph 2: Trajectory forecast — where the churn probability is heading and the key business drivers.
-Paragraph 3: Retention window and financial exposure — how much time is left and how much revenue is at risk.
-Paragraph 4: The single most urgent action with a concrete timeline and expected outcome.
+Paragraph 1: State the current churn risk score, the top business risk factors and their significance, where the trajectory is heading, and the retention window with financial exposure.
+Paragraph 2: The most urgent intervention — what to do, concrete timeline, expected outcome, and the revenue saved if successful.
 
-Separate each paragraph with one blank line.
+Separate the two paragraphs with one blank line.
 No bullet points. No headers. No markdown. No asterisks. No technical terms (SHAP, VADER, model names, ML jargon). Write directly without any opening phrase.
 """
 
