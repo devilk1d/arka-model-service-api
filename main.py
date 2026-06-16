@@ -830,13 +830,13 @@ SENTIMENT: {sent['label']} | Tone score: {tone:+.3f} | Urgency: {sent['urgency_l
 Feedback: "{feedback_str[:400]}"
 
 Rules for your JSON values:
-- score_reason: Write 3-4 sentences explaining why this churn risk score was assigned. Reference actual numbers and business metrics. Explain what each factor means for this account in plain business terms. Be specific and avoid generic statements.
-- risk_factors: exactly 3 short phrases (max 8 words each) describing the top business risk signals in plain business language.
-- feedback_signal: 1 plain sentence summarizing the main customer concern from their feedback.
-- retain: exactly 3 specific action items (max 12 words each) tailored to this customer's situation.
-- offer: exactly 3 specific offer items (max 12 words each) tailored to this plan and revenue level.
-- reason: 1 plain sentence explaining the retention logic.
-No asterisks, no bold, no markdown, no technical terms (such as SHAP, VADER, model names, or machine learning jargon) anywhere in any field.
+- score_reason: 2 sentences max. Sentence 1: state the score and the #1 risk factor with its measured impact. Sentence 2: what this means for the account in plain business terms with one more supporting metric.
+- risk_factors: exactly 3 short phrases (max 8 words each) citing actual business signals — include a number or metric in each phrase.
+- feedback_signal: 1 sentence citing the actual feedback content or sentiment score. Write "No feedback available" if there is none.
+- retain: exactly 3 action items (max 12 words each). Each must be specific to this customer — reference their plan ({r['plan_type']}), revenue level, or a metric from the data. No generic advice.
+- offer: exactly 3 offer items (max 12 words each). Each must be tailored to this plan and revenue — include a specific value, discount %, or timeframe.
+- reason: 1 sentence citing the most important data point that justifies this retention approach.
+No asterisks, no bold, no markdown, no technical terms (SHAP, VADER, model names, ML jargon) anywhere.
 
 Reply with this exact JSON structure:
 {{"score_reason":"...","risk_factors":["...","...","..."],"feedback_signal":"...","action":{{"retain":["...","...","..."],"offer":["...","...","..."],"reason":"..."}}}}"""
@@ -894,34 +894,34 @@ No asterisks, no bold, no markdown in any value.
 
 Reply with this exact JSON (all 4 fields required):
 {{
-  "narrative": "3-4 plain sentences: key characteristics, behavior, and business situation of this segment",
-  "defining_traits": ["trait one", "trait two", "trait three", "trait four"],
-  "top_priority_action": "1 plain sentence: the single highest-priority action for this segment",
-  "risk_summary": "1 plain sentence: churn risk summary for this segment"
+  "narrative": "2 sentences with specific numbers from the data: key characteristic and behavior, then business risk or opportunity.",
+  "defining_traits": ["trait with a metric", "trait with a metric", "trait with a metric"],
+  "top_priority_action": "1 sentence: the highest-priority action with a specific target or timeline",
+  "risk_summary": "1 sentence citing the churn rate and avg score from the data"
 }}"""
 
 
 # ─── Narrative / agent system prompts ─────────────────────────────────────────
 _SIM_NARRATIVE_SYSTEM = """\
-You are a senior customer success analyst at a SaaS company.
-Write EXACTLY 2 dense, information-rich paragraphs (3-4 sentences each) in plain English. Pack meaning into every sentence — no filler.
+You are a senior customer success analyst. Write a compact, data-driven assessment in plain English.
 
-Paragraph 1: State the current churn risk score, the top business risk factors and their significance, where the trajectory is heading, and the retention window with financial exposure.
-Paragraph 2: The most urgent intervention — what to do, concrete timeline, expected outcome, and the revenue saved if successful.
+Write 3-5 sentences total — exactly as many as the situation warrants, no more.
+Every sentence must cite at least one specific number from the data (churn score, revenue, days, %, usage hours).
+Cover: the churn risk level and its top drivers, the trajectory and financial exposure, and the single most urgent action with a concrete timeline.
+If a customer has low risk or strong metrics, say so briefly and stop — do not pad.
 
-Separate the two paragraphs with one blank line.
-No bullet points. No headers. No markdown. No asterisks. No technical terms (SHAP, VADER, model names, ML jargon). Write directly without any opening phrase.
+No bullet points. No headers. No markdown. No asterisks. No filler. No technical jargon. Write directly without any opening phrase.
 """
 
 _SCENARIO_NARRATIVE_SYSTEM = """\
-You are a senior customer success analyst at a SaaS company.
-Write EXACTLY 2 dense, information-rich paragraphs (3-4 sentences each) in plain English. Pack meaning into every sentence — no filler.
+You are a senior customer success analyst. Write a compact, data-driven scenario assessment in plain English.
 
-Paragraph 1: What this scenario proposes, the projected change in churn probability (use specific numbers), and the strongest data-backed reason it could succeed.
-Paragraph 2: The main risks and conditions for success, then the concrete next steps with a specific timeline and measurable success metrics.
+Write 3-5 sentences total — exactly as many as the situation warrants, no more.
+Every sentence must cite at least one specific number (probability change, revenue, timeline, %).
+Cover: what this intervention proposes and its projected impact on churn (with numbers), the main condition for success, and the immediate next step with a concrete deadline and success metric.
+If the impact is minor or risk is low, reflect that briefly — do not overstate.
 
-Separate the two paragraphs with one blank line.
-No bullet points. No headers. No markdown. No asterisks. Write directly without any opening phrase.
+No bullet points. No headers. No markdown. No asterisks. No filler. Write directly without any opening phrase.
 """
 
 _ASK_SYSTEM = """\
@@ -963,62 +963,78 @@ AGENT_PERSONAS = [
 AGENT_ANALYZE_SYSTEMS: dict[str, str] = {
     "Risk Analyst": (
         "You are a Churn Risk Analyst at a SaaS company. "
-        "Give 4-5 bullet points using - (hyphen). One short, clear sentence per point. No asterisks or bold.\n"
-        "Cover: the most critical business risk signal with its measured value, what behavioral pattern is driving churn, "
-        "one trend to watch, and one specific action to reduce risk. Use actual numbers. "
-        "Do not mention SHAP, VADER, or any technical ML/AI model names."
+        "Give exactly 3 bullet points using - (hyphen). One sentence each. No asterisks or bold. "
+        "Each point MUST cite a specific number from the data (score, days, %, revenue).\n"
+        "Cover: (1) the single most critical risk signal with its value and business meaning, "
+        "(2) the behavioral pattern driving it, "
+        "(3) one specific action to reduce risk with a concrete timeline. "
+        "No generic statements. No SHAP, VADER, or ML jargon."
     ),
     "Customer Success": (
         "You are a Customer Success Manager at a SaaS company. "
-        "Give 4-5 bullet points using - (hyphen). One short, clear sentence per point. No asterisks or bold.\n"
-        "Cover: root cause of disengagement or dissatisfaction, key engagement signal, "
-        "current customer sentiment summary in plain language, and one specific outreach action for this week. "
-        "Do not mention SHAP, VADER, or any technical ML/AI model names."
+        "Give exactly 3 bullet points using - (hyphen). One sentence each. No asterisks or bold. "
+        "Each point MUST cite a specific number or fact from the data.\n"
+        "Cover: (1) the root cause of disengagement with evidence from the data, "
+        "(2) the sentiment or feedback signal that confirms it, "
+        "(3) one specific outreach action this week with a measurable goal. "
+        "No generic statements. No SHAP, VADER, or ML jargon."
     ),
     "Finance Analyst": (
         "You are a Finance Analyst at a SaaS company. "
-        "Give 4-5 bullet points using - (hyphen). One short, clear sentence per point. No asterisks or bold.\n"
-        "Cover: estimated revenue loss if churned, customer value vs segment average, "
-        "economic case for retention, and one cost-effective offer with a concrete value. "
-        "Do not mention SHAP, VADER, or any technical ML/AI model names."
+        "Give exactly 3 bullet points using - (hyphen). One sentence each. No asterisks or bold. "
+        "Each point MUST include a dollar amount or percentage.\n"
+        "Cover: (1) revenue at risk if churned (calculate from the data), "
+        "(2) this customer's value vs segment average with numbers, "
+        "(3) the most cost-effective retention offer with its estimated ROI. "
+        "No generic statements. No SHAP, VADER, or ML jargon."
     ),
     "Product Manager": (
         "You are a Product Manager at a SaaS company. "
-        "Give 4-5 bullet points using - (hyphen). One short, clear sentence per point. No asterisks or bold.\n"
-        "Cover: biggest feature adoption gap driving churn, concerning usage pattern, "
-        "most relevant unused feature, and one specific product action to close the gap. "
-        "Do not mention SHAP, VADER, or any technical ML/AI model names."
+        "Give exactly 3 bullet points using - (hyphen). One sentence each. No asterisks or bold. "
+        "Each point MUST cite a specific metric from the data.\n"
+        "Cover: (1) the feature adoption or usage gap with its measured value, "
+        "(2) the usage pattern that signals disengagement, "
+        "(3) one specific product intervention with a success metric to track. "
+        "No generic statements. No SHAP, VADER, or ML jargon."
     ),
 }
 
 AGENT_SCENARIO_SYSTEMS: dict[str, str] = {
     "Risk Analyst": (
         "You are a Churn Risk Analyst at a SaaS company. "
-        "Analyze the proposed intervention. Give 4-5 bullet points using - (hyphen). One short, clear sentence per point. No asterisks or bold.\n"
-        "Cover: estimated churn reduction in percentage points, which business risk factor is most affected, "
-        "residual risk if it fails, and confidence level in this intervention. "
-        "Do not mention SHAP, VADER, or any technical ML/AI model names."
+        "Analyze the proposed intervention. Give exactly 3 bullet points using - (hyphen). One sentence each. No asterisks or bold. "
+        "Each point MUST cite a specific number.\n"
+        "Cover: (1) estimated churn reduction in percentage points if this works, "
+        "(2) the specific risk factor it addresses and by how much, "
+        "(3) residual risk if it fails, with a confidence assessment. "
+        "No generic statements. No SHAP, VADER, or ML jargon."
     ),
     "Customer Success": (
         "You are a Customer Success Manager at a SaaS company. "
-        "Analyze the proposed intervention. Give 4-5 bullet points using - (hyphen). One short, clear sentence per point. No asterisks or bold.\n"
-        "Cover: whether it addresses the real root cause, what supports or blocks success, "
-        "what must accompany it, and a realistic execution timeline. "
-        "Do not mention SHAP, VADER, or any technical ML/AI model names."
+        "Analyze the proposed intervention. Give exactly 3 bullet points using - (hyphen). One sentence each. No asterisks or bold. "
+        "Each point MUST be grounded in the customer's actual data.\n"
+        "Cover: (1) whether this addresses the real root cause and why, "
+        "(2) the biggest obstacle to success based on this customer's profile, "
+        "(3) execution timeline with one specific milestone. "
+        "No generic statements. No SHAP, VADER, or ML jargon."
     ),
     "Finance Analyst": (
         "You are a Finance Analyst at a SaaS company. "
-        "Analyze the proposed intervention. Give 4-5 bullet points using - (hyphen). One short, clear sentence per point. No asterisks or bold.\n"
-        "Cover: intervention cost vs revenue at risk, ROI with concrete numbers, "
-        "break-even point, and your financial recommendation. "
-        "Do not mention SHAP, VADER, or any technical ML/AI model names."
+        "Analyze the proposed intervention. Give exactly 3 bullet points using - (hyphen). One sentence each. No asterisks or bold. "
+        "Each point MUST include a dollar amount or percentage.\n"
+        "Cover: (1) cost of this intervention vs revenue at risk (with numbers), "
+        "(2) expected ROI if retention succeeds, "
+        "(3) financial recommendation — proceed, modify, or reject — with one-line reasoning. "
+        "No generic statements. No SHAP, VADER, or ML jargon."
     ),
     "Product Manager": (
         "You are a Product Manager at a SaaS company. "
-        "Analyze the proposed intervention. Give 4-5 bullet points using - (hyphen). One short, clear sentence per point. No asterisks or bold.\n"
-        "Cover: impact on feature adoption and engagement, most relevant feature for this intervention, "
-        "product change that strengthens the outcome, and the key metric to monitor. "
-        "Do not mention SHAP, VADER, or any technical ML/AI model names."
+        "Analyze the proposed intervention. Give exactly 3 bullet points using - (hyphen). One sentence each. No asterisks or bold. "
+        "Each point MUST cite a specific metric or feature.\n"
+        "Cover: (1) how this changes feature adoption or usage (with target metric), "
+        "(2) the product gap it closes for this customer specifically, "
+        "(3) the one KPI to monitor in the first 30 days. "
+        "No generic statements. No SHAP, VADER, or ML jargon."
     ),
 }
 
@@ -1253,11 +1269,14 @@ async def _extract_recommendations(
 
     prompt = (
         f"{context_note}\n\n"
-        f"Rules: each option is a short, specific action phrase (15-70 chars), in English, varied.\n\n"
-        f"Customer context:\n{ctx[:200]}\n\n"
+        f"Rules:\n"
+        f"- Each option is a concrete action phrase (15-60 chars), grounded in this customer's actual data.\n"
+        f"- Reference the customer's plan type, churn score, revenue, usage level, or a specific metric — no generic advice.\n"
+        f"- Each option must be distinct (different lever: price, engagement, product, support).\n\n"
+        f"Customer context:\n{ctx[:300]}\n\n"
         f"Agent outputs:\n{debate_text}\n\n"
         f"Return ONLY a valid JSON array of exactly 4 strings. No explanation, no fences.\n"
-        f"Example: [\"Offer 20% discount for 3 months\", \"Assign dedicated CSM\", ...]"
+        f"Example: [\"Offer 20% discount on Annual plan renewal\", \"Assign CSM for 90-day check-ins\", ...]"
     )
 
     _fallback = _build_contextual_fallback(risk_level, cp, scenario)
@@ -1565,7 +1584,7 @@ async def simulate(request: SimulateRequest):
                 
                 content = ""
                 # 2. Stream tokens into the queue
-                async for tok in stream_llm_no_think(system, agent_ctx, max_tokens=1200):
+                async for tok in stream_llm_no_think(system, agent_ctx, max_tokens=450):
                     content += tok
                     await queue.put({"type": "agent_token", "agent": name, "content": tok})
                 
@@ -1680,7 +1699,7 @@ async def simulate(request: SimulateRequest):
                 + f"\n\nTEAM ANALYSIS:\n{debate_text[:600]}"
             )
             full_narrative = ""
-            async for tok in stream_llm_no_think(_SIM_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=1500):
+            async for tok in stream_llm_no_think(_SIM_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=450):
                 full_narrative += tok
                 yield f"data: {json.dumps({'type': 'token', 'content': tok})}\n\n"
 
@@ -1802,7 +1821,7 @@ async def simulate(request: SimulateRequest):
             f"revenue_at_risk=${update_data.get('revenue_at_risk', 0):,.0f}."
         )
         full_narrative = ""
-        async for tok in stream_llm_no_think(_SCENARIO_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=1500):
+        async for tok in stream_llm_no_think(_SCENARIO_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=450):
             full_narrative += tok
             yield f"data: {json.dumps({'type': 'token', 'content': tok})}\n\n"
 
