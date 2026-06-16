@@ -637,7 +637,7 @@ async def call_llm(system: str, user_msg: str, max_tokens: int = 1200) -> str:
     raise RuntimeError(f"all LLM providers failed: {type(last_err).__name__}: {str(last_err)[:120]}")
 
 
-async def _call_llm_xai(prompt: str, max_tokens: int = 700) -> str:
+async def _call_llm_xai(prompt: str, max_tokens: int = 1400) -> str:
     """XAI/JSON mode LLM call. Returns raw JSON string — do NOT strip markdown here.
     Tries each provider (Groq → Ollama) until one returns content."""
     last_err = None
@@ -830,12 +830,12 @@ SENTIMENT: {sent['label']} | Tone score: {tone:+.3f} | Urgency: {sent['urgency_l
 Feedback: "{feedback_str[:400]}"
 
 Rules for your JSON values:
-- score_reason: 2 sentences max. Sentence 1: state the score and the #1 risk factor with its measured impact. Sentence 2: what this means for the account in plain business terms with one more supporting metric.
-- risk_factors: exactly 3 short phrases (max 8 words each) citing actual business signals — include a number or metric in each phrase.
-- feedback_signal: 1 sentence citing the actual feedback content or sentiment score. Write "No feedback available" if there is none.
-- retain: exactly 3 action items (max 12 words each). Each must be specific to this customer — reference their plan ({r['plan_type']}), revenue level, or a metric from the data. No generic advice.
-- offer: exactly 3 offer items (max 12 words each). Each must be tailored to this plan and revenue — include a specific value, discount %, or timeframe.
-- reason: 1 sentence citing the most important data point that justifies this retention approach.
+- score_reason: Write 4–6 sentences as a coherent paragraph. Cover all of: (1) state the churn score and name the #1 risk factor with its measured value; (2) explain what that factor means in business terms and how it puts the account at risk; (3) bring in a second or third risk signal with its metric to show the pattern; (4) describe the customer's engagement or financial profile (revenue, usage, adoption, NPS) and what it reveals about the relationship; (5) conclude with the overall business exposure and what the situation calls for. Make every sentence specific — use actual numbers from the data, no vague generalizations.
+- risk_factors: exactly 3 concise phrases (max 12 words each) citing actual business signals — each must contain a specific number, metric, or measurement from the data.
+- feedback_signal: 1–2 sentences. Describe what the customer's feedback or sentiment reveals about their experience, citing the actual tone score, urgency level, or a quoted keyword. Write "No customer feedback recorded." if there is none.
+- retain: exactly 3 action items (max 15 words each). Each must be specific to this customer — reference their plan ({r['plan_type']}), revenue level, or a metric from the data. No generic advice.
+- offer: exactly 3 offer items (max 15 words each). Each must be tailored to this plan and revenue — include a specific value, discount %, or timeframe.
+- reason: 1–2 sentences citing the most important data points that justify this retention approach and the financial stake.
 No asterisks, no bold, no markdown, no technical terms (SHAP, VADER, model names, ML jargon) anywhere.
 
 Reply with this exact JSON structure:
