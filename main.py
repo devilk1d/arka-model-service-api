@@ -193,7 +193,35 @@ _FEATURE_LABEL_MAP = {
     "nps_x_dunning":             "Satisfaction vs. Payment Risk",
     "revenue_per_month":         "Monthly Revenue",
     "payments_per_month":        "Payment Frequency",
+    # Encoded categorical & raw features missing from original map
+    "contract_enc":              "Contract Type",
+    "plan_enc":                  "Subscription Plan",
+    "tenure_days":               "Account Tenure",
+    "days_since_last_payment":   "Days Since Last Payment",
+    "days_since_login":          "Days Since Last Login",
+    "monthly_usage_hrs":         "Monthly Usage Hours",
+    "feature_adoption_pct":      "Feature Adoption Rate",
+    "avg_nps_score":             "Average NPS Score",
+    "total_users":               "Total Users",
+    "total_tickets":             "Total Support Tickets",
+    "dunning_count":             "Late / Missed Payments",
+    "avg_payment_delay":         "Average Payment Delay",
 }
+
+
+def _resolve_feature_label(k: str) -> str:
+    if k in _FEATURE_LABEL_MAP:
+        return _FEATURE_LABEL_MAP[k]
+    # topic_N → actual topic name from NLP model artifacts
+    if k.startswith("topic_"):
+        try:
+            ti = int(k.split("_")[1])
+            if ti < len(TOPIC_NAMES) and TOPIC_NAMES[ti]:
+                return f"Feedback Theme: {TOPIC_NAMES[ti]}"
+        except (ValueError, IndexError):
+            pass
+        return "Feedback Topic Signal"
+    return k.replace("_", " ").title()
 
 
 def get_top_shap(shap_row: pd.Series, top_n: int = 5) -> list:
@@ -204,7 +232,7 @@ def get_top_shap(shap_row: pd.Series, top_n: int = 5) -> list:
             "impact_score":  round(float(shap_row[k]), 4),
             "direction":     "raises_risk" if shap_row[k] > 0 else "lowers_risk",
             "importance":    round(abs(float(shap_row[k])), 4),
-            "feature_label": _FEATURE_LABEL_MAP.get(k, k.replace("_", " ").title()),
+            "feature_label": _resolve_feature_label(k),
         }
         for k in top.index
     ]
@@ -830,7 +858,7 @@ SENTIMENT: {sent['label']} | Tone score: {tone:+.3f} | Urgency: {sent['urgency_l
 Feedback: "{feedback_str[:400]}"
 
 Rules for your JSON values:
-- score_reason: Write 4–6 sentences as a coherent paragraph. Cover all of: (1) state the churn score and name the #1 risk factor with its measured value; (2) explain what that factor means in business terms and how it puts the account at risk; (3) bring in a second or third risk signal with its metric to show the pattern; (4) describe the customer's engagement or financial profile (revenue, usage, adoption, NPS) and what it reveals about the relationship; (5) conclude with the overall business exposure and what the situation calls for. Make every sentence specific — use actual numbers from the data, no vague generalizations.
+- score_reason: Write 3–5 sentences as a coherent paragraph. Cover all of: (1) state the churn score and name the #1 risk factor with its measured value; (2) explain what that factor means in business terms and how it puts the account at risk; (3) bring in a second or third risk signal with its metric to show the pattern; (4) describe the customer's engagement or financial profile (revenue, usage, adoption, NPS) and what it reveals about the relationship; (5) conclude with the overall business exposure and what the situation calls for. Make every sentence specific — use actual numbers from the data, no vague generalizations.
 - risk_factors: exactly 3 concise phrases (max 12 words each) citing actual business signals — each must contain a specific number, metric, or measurement from the data.
 - feedback_signal: 1–2 sentences. Describe what the customer's feedback or sentiment reveals about their experience, citing the actual tone score, urgency level, or a quoted keyword. Write "No customer feedback recorded." if there is none.
 - retain: exactly 3 action items (max 15 words each). Each must be specific to this customer — reference their plan ({r['plan_type']}), revenue level, or a metric from the data. No generic advice.
