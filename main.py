@@ -589,9 +589,9 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
         }
 
         seg_rfm_context = {
-            "days_since_login":     {"customer": round(float(row.get("days_since_login", 0)), 1),
+            "days_since_login":     {"customer": round(float(row.get("days_since_login", 0) if pd.notna(row.get("days_since_login")) else 0), 1),
                                      "segment_avg": 0.0},
-            "payment_count":        {"customer": round(float(row.get("payment_count", 0)), 1),
+            "payment_count":        {"customer": round(float(row.get("payment_count", 0) if pd.notna(row.get("payment_count")) else 0), 1),
                                      "segment_avg": round(float(centroid.get("payment_count", 0)), 1)},
             "total_revenue":        {"customer": round(float(row.get("total_revenue", 0) if pd.notna(row.get("total_revenue")) else 0), 1),
                                      "segment_avg": round(float(centroid.get("total_revenue", 0)), 1)},
@@ -599,7 +599,7 @@ def run_full_pipeline(ca_df, um_df, bd_df, st_df, nps_df):
                                      "segment_avg": round(float(centroid.get("monthly_usage_hrs", 0)), 1)},
             "feature_adoption_pct": {"customer": round(float(row.get("feature_adoption_pct", 0) if pd.notna(row.get("feature_adoption_pct")) else 0), 1),
                                      "segment_avg": round(float(centroid.get("feature_adoption_pct", 0)), 1)},
-            "avg_nps_score":        {"customer": round(float(row.get("avg_nps_score", 0)), 2),
+            "avg_nps_score":        {"customer": round(float(row.get("avg_nps_score", 0) if pd.notna(row.get("avg_nps_score")) else 0), 2),
                                      "segment_avg": round(float(centroid.get("avg_nps_score", 0)), 2)},
         }
 
@@ -834,12 +834,12 @@ def build_churn_xai_prompt(r: dict) -> str:
     ])
     sent     = r["sentiment"]
     rfm      = r["segment_rfm_context"]
-    revenue  = rfm.get("total_revenue",       {}).get("customer", 0)
-    usage    = rfm.get("monthly_usage_hrs",    {}).get("customer", 0)
-    adoption = rfm.get("feature_adoption_pct", {}).get("customer", 0)
-    nps      = rfm.get("avg_nps_score",        {}).get("customer", 0)
-    tenure   = rfm.get("days_since_login",     {}).get("customer", 0)
-    tone     = sent.get("tone_score", sent.get("vader_compound", 0))
+    revenue  = rfm.get("total_revenue",       {}).get("customer", 0) or 0
+    usage    = rfm.get("monthly_usage_hrs",    {}).get("customer", 0) or 0
+    adoption = rfm.get("feature_adoption_pct", {}).get("customer", 0) or 0
+    nps      = rfm.get("avg_nps_score",        {}).get("customer", 0) or 0
+    tenure   = rfm.get("days_since_login",     {}).get("customer", 0) or 0
+    tone     = sent.get("tone_score", sent.get("vader_compound", 0)) or 0
 
     feedback_items = sent.get("feedback_texts", [])
     feedback_str   = " | ".join(feedback_items[:5]) if feedback_items else "No feedback available"
@@ -1160,12 +1160,12 @@ def _build_ctx(c, scenario: str) -> str:
         f"({'increases' if f.get('direction', '') in ('raises_risk', 'increases_churn') else 'decreases'} risk)"
         for f in c.shap_top5
     )
-    rev      = rfm.get("total_revenue",       {}).get("customer", 0)
-    usage    = rfm.get("monthly_usage_hrs",    {}).get("customer", 0)
-    adoption = rfm.get("feature_adoption_pct", {}).get("customer", 0)
-    nps      = rfm.get("avg_nps_score",        {}).get("customer", 0)
-    dsl      = rfm.get("days_since_login",     {}).get("customer", 0)
-    tone     = c.sentiment.get("tone_score", c.sentiment.get("vader_compound", 0))
+    rev      = rfm.get("total_revenue",       {}).get("customer", 0) or 0
+    usage    = rfm.get("monthly_usage_hrs",    {}).get("customer", 0) or 0
+    adoption = rfm.get("feature_adoption_pct", {}).get("customer", 0) or 0
+    nps      = rfm.get("avg_nps_score",        {}).get("customer", 0) or 0
+    dsl      = rfm.get("days_since_login",     {}).get("customer", 0) or 0
+    tone     = c.sentiment.get("tone_score", c.sentiment.get("vader_compound", 0)) or 0
 
     feedback_items   = c.sentiment.get("feedback_texts", [])
     feedback_preview = feedback_items[0][:150] if feedback_items else "No feedback"
