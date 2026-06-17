@@ -108,7 +108,10 @@ def _build_providers() -> list[dict]:
         "name": "ollama", "base": OLLAMA_URL, "key": OLLAMA_KEY, "model": OLLAMA_MODEL,
         "native_ollama": ("localhost" in OLLAMA_URL or "127.0.0.1" in OLLAMA_URL
                           or OLLAMA_URL.endswith("/api")),
-        "extra": {},
+        # gpt-oss is a reasoning model: without this it burns the whole token
+        # budget on hidden reasoning and returns EMPTY content. Keep reasoning
+        # minimal so it actually answers within max_tokens.
+        "extra": {"reasoning_effort": "low"},
     })
     return provs
 
@@ -658,7 +661,13 @@ async def call_llm(system: str, user_msg: str, max_tokens: int = 1200) -> str:
                 resp = await client.post(f"{p['base']}/chat/completions",
                                          headers=_provider_headers(p), json=payload)
                 resp.raise_for_status()
-                return resp.json()["choices"][0]["message"]["content"]
+                content = (resp.json()["choices"][0]["message"].get("content") or "").strip()
+            if content:
+                return content
+            # Empty content (e.g. a reasoning model that spent the whole budget
+            # thinking) is NOT a success — fall through to the next provider.
+            last_err = RuntimeError(f"{p['name']} returned empty content")
+            continue
         except Exception as e:
             last_err = e
             continue
@@ -746,10 +755,9 @@ async def stream_llm(system: str, user_msg: str, max_tokens: int = 600):
                             return
                         try:
                             obj   = json.loads(data)
-                            delta = obj["choices"][0]["delta"]
-                            # Some providers/models stream the answer under a
-                            # reasoning field instead of "content"; accept either.
-                            token = delta.get("content") or delta.get("reasoning_content") or ""
+                            # Only the answer ("content") — never the reasoning
+                            # channel, which would leak chain-of-thought into the UI.
+                            token = obj["choices"][0]["delta"].get("content", "")
                             if token:
                                 started = True
                                 yield token
@@ -818,7 +826,7 @@ async def _ensure_narrative(streamed: str, system: str, prompt: str) -> str:
     if streamed and streamed.strip():
         return streamed
     try:
-        fb = await call_llm(system, prompt, max_tokens=450)
+        fb = await call_llm(system, prompt, max_tokens=700)
         return re.sub(r"<think>.*?</think>", "", fb, flags=re.DOTALL).strip()
     except Exception:
         return streamed
@@ -1896,7 +1904,7 @@ async def simulate(request: SimulateRequest):
                 
                 content = ""
                 # 2. Stream tokens into the queue
-                async for tok in stream_llm_no_think(system, agent_ctx, max_tokens=450):
+                async for tok in stream_llm_no_think(system, agent_ctx, max_tokens=700):
                     content += tok
                     await queue.put({"type": "agent_token", "agent": name, "content": tok})
 
@@ -1906,7 +1914,7 @@ async def simulate(request: SimulateRequest):
                 _streamed = content.strip()
                 if (not _streamed) or _streamed.startswith("[Error"):
                     try:
-                        fb = re.sub(r"<think>.*?</think>", "", await call_llm(system, agent_ctx, max_tokens=450),
+                        fb = re.sub(r"<think>.*?</think>", "", await call_llm(system, agent_ctx, max_tokens=700),
                                     flags=re.DOTALL)
                         fb = _strip_markdown(fb).strip()
                     except Exception:
@@ -2029,7 +2037,7 @@ async def simulate(request: SimulateRequest):
                 + f"\n\nTEAM ANALYSIS:\n{debate_text[:600]}"
             )
             full_narrative = ""
-            async for tok in stream_llm_no_think(_SIM_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=450):
+            async for tok in stream_llm_no_think(_SIM_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=700):
                 full_narrative += tok
                 yield f"data: {json.dumps({'type': 'token', 'content': tok})}\n\n"
 
@@ -2132,7 +2140,7 @@ async def simulate(request: SimulateRequest):
             f"revenue_at_risk=${update_data.get('revenue_at_risk', 0):,.0f}."
         )
         full_narrative = ""
-        async for tok in stream_llm_no_think(_SCENARIO_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=450):
+        async for tok in stream_llm_no_think(_SCENARIO_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=700):
             full_narrative += tok
             yield f"data: {json.dumps({'type': 'token', 'content': tok})}\n\n"
 
