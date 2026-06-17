@@ -826,7 +826,7 @@ async def _ensure_narrative(streamed: str, system: str, prompt: str) -> str:
     if streamed and streamed.strip():
         return streamed
     try:
-        fb = await call_llm(system, prompt, max_tokens=700)
+        fb = await call_llm(system, prompt, max_tokens=900)
         return re.sub(r"<think>.*?</think>", "", fb, flags=re.DOTALL).strip()
     except Exception:
         return streamed
@@ -960,25 +960,23 @@ Reply with this exact JSON (all 4 fields required):
 
 # ─── Narrative / agent system prompts ─────────────────────────────────────────
 _SIM_NARRATIVE_SYSTEM = """\
-You are a senior customer success analyst. Write a compact, data-driven assessment in plain English.
+You are a senior customer success analyst. Write a data-driven assessment in plain English using EXACTLY 2 paragraphs separated by a blank line.
 
-Write 3-5 sentences total — exactly as many as the situation warrants, no more.
-Every sentence must cite at least one specific number from the data (churn score, revenue, days, %, usage hours).
-Cover: the churn risk level and its top drivers, the trajectory and financial exposure, and the single most urgent action with a concrete timeline.
-If a customer has low risk or strong metrics, say so briefly and stop — do not pad.
+Paragraph 1 (2-3 sentences): State the churn score and risk level. Name the top 2 drivers with their measured values and explain what they mean for the business. Include the revenue at risk or financial exposure using specific numbers.
 
-No bullet points. No headers. No markdown. No asterisks. No filler. No technical jargon. Write directly without any opening phrase.
+Paragraph 2 (2-3 sentences): Describe the trajectory outlook and what it signals about the relationship. End with the single most urgent action, a concrete timeline (e.g. "within 7 days", "this week"), and one measurable success metric to track.
+
+Rules: Every sentence must cite at least one specific number. No bullet points. No headers. No markdown. No asterisks. No filler. No technical jargon. Write directly — no opening phrase like "This customer" or "Based on the data".
 """
 
 _SCENARIO_NARRATIVE_SYSTEM = """\
-You are a senior customer success analyst. Write a compact, data-driven scenario assessment in plain English.
+You are a senior customer success analyst. Write a data-driven scenario assessment in plain English using EXACTLY 2 paragraphs separated by a blank line.
 
-Write 3-5 sentences total — exactly as many as the situation warrants, no more.
-Every sentence must cite at least one specific number (probability change, revenue, timeline, %).
-Cover: what this intervention proposes and its projected impact on churn (with numbers), the main condition for success, and the immediate next step with a concrete deadline and success metric.
-If the impact is minor or risk is low, reflect that briefly — do not overstate.
+Paragraph 1 (2-3 sentences): State what this intervention proposes. Cite the projected churn reduction in percentage points and the revenue at risk it addresses. Note the effectiveness level and which specific churn driver(s) this tackles — with the measured values.
 
-No bullet points. No headers. No markdown. No asterisks. No filler. Write directly without any opening phrase.
+Paragraph 2 (2-3 sentences): Describe the main condition for this intervention to succeed, grounded in the customer's actual profile. End with the immediate next step, a concrete deadline, and the one KPI to monitor in the first 30 days.
+
+Rules: Every sentence must cite at least one specific number. If the impact is minor, reflect that — do not overstate. No bullet points. No headers. No markdown. No asterisks. No filler. Write directly — no opening phrase.
 """
 
 _ASK_SYSTEM = """\
@@ -2037,7 +2035,7 @@ async def simulate(request: SimulateRequest):
                 + f"\n\nTEAM ANALYSIS:\n{debate_text[:600]}"
             )
             full_narrative = ""
-            async for tok in stream_llm_no_think(_SIM_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=700):
+            async for tok in stream_llm_no_think(_SIM_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=900):
                 full_narrative += tok
                 yield f"data: {json.dumps({'type': 'token', 'content': tok})}\n\n"
 
@@ -2140,7 +2138,7 @@ async def simulate(request: SimulateRequest):
             f"revenue_at_risk=${update_data.get('revenue_at_risk', 0):,.0f}."
         )
         full_narrative = ""
-        async for tok in stream_llm_no_think(_SCENARIO_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=700):
+        async for tok in stream_llm_no_think(_SCENARIO_NARRATIVE_SYSTEM, narrative_prompt, max_tokens=900):
             full_narrative += tok
             yield f"data: {json.dumps({'type': 'token', 'content': tok})}\n\n"
 
