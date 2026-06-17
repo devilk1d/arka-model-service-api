@@ -746,13 +746,22 @@ async def stream_llm(system: str, user_msg: str, max_tokens: int = 600):
                             return
                         try:
                             obj   = json.loads(data)
-                            token = obj["choices"][0]["delta"].get("content", "")
+                            delta = obj["choices"][0]["delta"]
+                            # Some providers/models stream the answer under a
+                            # reasoning field instead of "content"; accept either.
+                            token = delta.get("content") or delta.get("reasoning_content") or ""
                             if token:
                                 started = True
                                 yield token
                         except (json.JSONDecodeError, KeyError, IndexError):
                             pass
-            return  # provider finished cleanly
+            if started:
+                return  # provider produced output — done
+            # Stream finished but produced NO content (e.g. a rate-limited 200
+            # response, or a reasoning-only completion). Do NOT return empty —
+            # fall through to the next provider.
+            last_err = RuntimeError("empty stream (no content tokens)")
+            continue
         except Exception as exc:
             last_err = exc
             if started:
@@ -801,6 +810,18 @@ async def stream_llm_no_think(system: str, user_msg: str, max_tokens: int = 600)
 
     if buf and not in_think:
         yield buf
+
+
+async def _ensure_narrative(streamed: str, system: str, prompt: str) -> str:
+    """Guarantee a non-empty narrative. If the streamed text came back blank
+    (empty/rate-limited stream), retry once via the reliable non-streaming call."""
+    if streamed and streamed.strip():
+        return streamed
+    try:
+        fb = await call_llm(system, prompt, max_tokens=450)
+        return re.sub(r"<think>.*?</think>", "", fb, flags=re.DOTALL).strip()
+    except Exception:
+        return streamed
 
 
 def _extract_json(raw: str) -> dict:
@@ -1878,7 +1899,22 @@ async def simulate(request: SimulateRequest):
                 async for tok in stream_llm_no_think(system, agent_ctx, max_tokens=450):
                     content += tok
                     await queue.put({"type": "agent_token", "agent": name, "content": tok})
-                
+
+                # 2b. If streaming produced nothing usable (empty/rate-limited
+                # stream, or only an error marker), retry once via the reliable
+                # non-streaming call so the agent never renders as an empty skeleton.
+                _streamed = content.strip()
+                if (not _streamed) or _streamed.startswith("[Error"):
+                    try:
+                        fb = re.sub(r"<think>.*?</think>", "", await call_llm(system, agent_ctx, max_tokens=450),
+                                    flags=re.DOTALL)
+                        fb = _strip_markdown(fb).strip()
+                    except Exception:
+                        fb = ""
+                    if fb:
+                        content = fb
+                        await queue.put({"type": "agent_token", "agent": name, "content": fb})
+
                 # 3. Put agent_done event into the queue
                 await queue.put({"type": "agent_done", "agent": name, "content": _strip_markdown(content)})
             except Exception as e:
@@ -1902,9 +1938,12 @@ async def simulate(request: SimulateRequest):
                 outputs[evt["agent"]] += evt["content"]
                 yield f"data: {json.dumps({'type': 'agent_token', 'agent': evt['agent'], 'content': evt['content']})}\n\n"
             elif evt["type"] == "agent_done":
-                # Ensure the content is stripped and saved
-                outputs[evt["agent"]] = _strip_markdown(outputs[evt["agent"]])
-                yield f"data: {json.dumps({'type': 'agent_done', 'agent': evt['agent']})}\n\n"
+                # Prefer the producer's final, authoritative content over the
+                # token-accumulated text — this carries the non-streaming fallback
+                # (empty/error case) and lets the client replace any stale tokens.
+                final_content = (evt.get("content") or "").strip() or _strip_markdown(outputs[evt["agent"]])
+                outputs[evt["agent"]] = final_content
+                yield f"data: {json.dumps({'type': 'agent_done', 'agent': evt['agent'], 'content': final_content})}\n\n"
                 completed_agents += 1
             queue.task_done()
 
@@ -1994,6 +2033,7 @@ async def simulate(request: SimulateRequest):
                 full_narrative += tok
                 yield f"data: {json.dumps({'type': 'token', 'content': tok})}\n\n"
 
+            full_narrative = await _ensure_narrative(full_narrative, _SIM_NARRATIVE_SYSTEM, narrative_prompt)
             yield f"data: {json.dumps({'type': 'done', 'narrative': _clean_narrative(full_narrative)})}\n\n"
             return
 
@@ -2096,6 +2136,7 @@ async def simulate(request: SimulateRequest):
             full_narrative += tok
             yield f"data: {json.dumps({'type': 'token', 'content': tok})}\n\n"
 
+        full_narrative = await _ensure_narrative(full_narrative, _SCENARIO_NARRATIVE_SYSTEM, narrative_prompt)
         yield f"data: {json.dumps({'type': 'done', 'narrative': _clean_narrative(full_narrative)})}\n\n"
 
     return StreamingResponse(
