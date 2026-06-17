@@ -1128,28 +1128,291 @@ Rules:
 """
 
 
-_SCENARIO_UPDATE_JSON_SYSTEM = """\
-You are a retention analytics engine. A multi-agent team has debated an intervention.
-Produce a JSON update. Output ONLY valid JSON.
+# ── Data-driven intervention effectiveness ─────────────────────────────────────
+# Each churn-driver "family" lists (a) substrings that identify it inside a SHAP
+# feature_label and (b) scenario keywords that would actually address it. A
+# scenario only reduces churn to the extent it tackles the customer's REAL risk
+# drivers — an irrelevant perk leaves the score essentially unchanged.
+_DRIVER_FAMILIES = {
+    "login":     {"label": ("login",),
+                  "scenario": ("login", "re-engage", "reengage", "re-engagement", "engagement",
+                               "campaign", "demo", "outreach", "check-in", "check in", "win-back", "winback")},
+    "usage":     {"label": ("usage",),
+                  "scenario": ("usage", "onboard", "training", "activation", "workshop", "enablement", "demo")},
+    "adoption":  {"label": ("adoption", "feature"),
+                  "scenario": ("adoption", "feature", "training", "onboard", "activation", "enablement",
+                               "workshop", "premium")},
+    "nps":       {"label": ("nps", "satisfaction"),
+                  "scenario": ("nps", "survey", "satisfaction", "feedback", "call", "apolog",
+                               "relationship", "qbr", "review", "concierge")},
+    "billing":   {"label": ("payment", "dunning", "late", "missed", "billing"),
+                  "scenario": ("discount", "price", "pricing", "billing", "payment", "auto-bill",
+                               "autopay", "credit", "refund", "waive", "invoice", "dunning")},
+    "support":   {"label": ("ticket", "support"),
+                  "scenario": ("support", "ticket", "priority", "resolve", "escalat", "fix",
+                               "bug", "sla", "technical")},
+    "contract":  {"label": ("contract",),
+                  "scenario": ("contract", "annual", "renew", "lock", "term", "commitment")},
+    "plan":      {"label": ("plan", "subscription"),
+                  "scenario": ("plan", "upgrade", "downgrade", "tier", "premium", "package")},
+    "tenure":    {"label": ("tenure",),
+                  "scenario": ("loyalty", "vip", "reward", "anniversary", "ambassador", "appreciation")},
+    "revenue":   {"label": ("revenue",),
+                  "scenario": ("discount", "credit", "roi", "value", "pricing")},
+    "sentiment": {"label": ("dissatisfaction", "feedback", "intent", "contrast"),
+                  "scenario": ("apolog", "call", "relationship", "concierge", "executive", "listen")},
+}
+
+# Broad relationship plays help several families a little even without a keyword hit.
+_BROAD_SCENARIO_KW = ("dedicated", "account manager", "success manager", "csm",
+                      "executive sponsor", "concierge", "white-glove", "white glove")
+
+
+def _estimate_intervention_effect(c, scenario: str, time_points: list) -> dict:
+    """Estimate, from this customer's real data, how effective the scenario is.
+
+    Returns effectiveness in roughly [-0.06, 0.80] (fraction of the realistically
+    recoverable churn that the intervention removes), plus the projected final
+    score. Effectiveness is NOT assumed positive — an off-target intervention on
+    an unhappy customer can be ~0 or mildly negative.
+    """
+    base = float(getattr(c, "churn_score", 0) or 0)
+    scen = (scenario or "").strip().lower()
+    has_scenario = bool(scen)
+
+    # 1. Risk-raising drivers and their strengths (only positive-impact ones).
+    risk_drivers = []
+    for f in (getattr(c, "shap_top5", None) or []):
+        try:
+            impact = float(f.get("impact_score", f.get("shap_value", 0)) or 0)
+        except (TypeError, ValueError):
+            impact = 0.0
+        raises = f.get("direction", "") in ("raises_risk", "increases_churn") or impact > 0
+        if raises and impact > 0:
+            risk_drivers.append((str(f.get("feature_label", "")).lower(), abs(impact)))
+    total_w = sum(w for _, w in risk_drivers) or 1e-9
+
+    # 2. Which families does the scenario address?
+    addressed = set()
+    if has_scenario:
+        for fam, spec in _DRIVER_FAMILIES.items():
+            if any(kw in scen for kw in spec["scenario"]):
+                addressed.add(fam)
+    broad = has_scenario and any(kw in scen for kw in _BROAD_SCENARIO_KW)
+    if broad:
+        addressed |= {"login", "usage", "nps", "support"}
+
+    # 3. Coverage = weighted share of the customer's risk drivers the scenario tackles.
+    covered_w, matched = 0.0, []
+    for label, w in risk_drivers:
+        fams = {fam for fam, spec in _DRIVER_FAMILIES.items()
+                if any(p in label for p in spec["label"])}
+        if fams & addressed:
+            covered_w += w
+            matched.append(label)
+    coverage = covered_w / total_w  # 0..1
+
+    # 4. Base effectiveness from how well it fits the real drivers.
+    if not has_scenario:
+        eff = 0.0
+    else:
+        generic = 0.05 if addressed else 0.02       # plausible action vs. vague text
+        eff = generic + coverage * 0.62             # on-target work earns the lift
+        if broad:
+            eff += 0.04
+
+    # 5. Modifiers from the customer's actual state.
+    sent     = getattr(c, "sentiment", None) or {}
+    try:
+        tone = float(sent.get("tone_score", sent.get("vader_compound", 0)) or 0)
+    except (TypeError, ValueError):
+        tone = 0.0
+    urgency  = str(sent.get("urgency_level", "")).lower()
+    rfm      = getattr(c, "segment_rfm_context", None) or {}
+    nps      = (rfm.get("avg_nps_score", {}) or {}).get("customer", 0) or 0
+
+    if tone <= -0.3:                         eff *= 0.70   # angry customers are hard to win back
+    if "high" in urgency or "critical" in urgency: eff *= 0.82
+    if nps and nps <= 3:                     eff *= 0.85
+
+    # Deeply entrenched churn is sticky — cap the short-horizon turnaround.
+    if base >= 90:                           eff = min(eff, 0.45)
+    elif base >= 75:                         eff = min(eff, 0.60)
+
+    # A clearly irrelevant intervention for an unhappy customer can mildly backfire.
+    if has_scenario and coverage < 0.05 and tone < -0.2:
+        eff = min(eff, -0.04)
+
+    eff = max(-0.06, min(0.80, eff))
+
+    # 6. Realistic floor and projected final score.
+    floor = max(3.0, base * (0.35 if base >= 90 else 0.25))
+    proj_final = base - eff * (base - floor)
+    proj_final = max(0.0, min(100.0, proj_final))
+
+    return {
+        "effectiveness": round(eff, 3),
+        "coverage":      round(coverage, 3),
+        "matched_drivers": matched,
+        "addressed":     sorted(addressed),
+        "proj_final":    round(proj_final, 2),
+        "floor":         round(floor, 2),
+        "has_scenario":  has_scenario,
+    }
+
+
+def _project_curve(base: float, proj_final: float, time_points: list, seed_key) -> list:
+    """Glide from base → proj_final with a realistic ease-out and mild wobble."""
+    import random
+    rng  = random.Random(hash(str(seed_key)) % (2**31))
+    n    = len(time_points)
+    span = base - proj_final
+    pts  = []
+    for i, w in enumerate(time_points):
+        if i == 0:
+            pts.append({"week": w, "prob": round(base, 2)}); continue
+        frac = i / (n - 1) if n > 1 else 1.0
+        ease = 1 - (1 - frac) ** 1.7            # most of the move happens early, then settles
+        val  = base - span * ease
+        if 0 < i < n - 1:
+            val += rng.uniform(-1.8, 1.8)       # small realistic week-to-week noise
+        pts.append({"week": w, "prob": round(max(0.0, min(100.0, val)), 2)})
+    pts[-1]["prob"] = round(max(0.0, min(100.0, proj_final)), 2)
+    return pts
+
+
+def _shift_segment_migration(cur_seg, seg_lbls, base: float, eff: float) -> list:
+    """Shift segment probabilities toward retention IN PROPORTION to effectiveness.
+
+    Low effectiveness barely moves the mix; negative effectiveness shifts slightly
+    toward risk. Always returns a distribution summing to ~1.0.
+    """
+    if cur_seg and len([s for s in cur_seg if isinstance(s, dict) and "label" in s]) >= 2:
+        items = [{"label": s["label"], "prob": max(0.0, float(s.get("prob", 0) or 0))}
+                 for s in cur_seg if isinstance(s, dict) and "label" in s]
+    elif seg_lbls and len(seg_lbls) >= 2:
+        n = len(seg_lbls); b = base / 100
+        raw = [b * (n - 1 - i) + (1 - b) * i for i in range(n)]
+        items = [{"label": seg_lbls[i], "prob": raw[i]} for i in range(n)]
+    else:
+        b = base / 100
+        items = [{"label": "Churned",   "prob": b * 0.55},
+                 {"label": "High Risk", "prob": b * 0.25},
+                 {"label": "At Risk",   "prob": (1 - b) * 0.40},
+                 {"label": "Retained",  "prob": (1 - b) * 0.60}]
+    tot = sum(i["prob"] for i in items) or 1.0
+    for i in items:
+        i["prob"] /= tot
+
+    _churn_kw = ("churn", "risk", "critical", "danger", "high", "detractor")
+    _keep_kw  = ("retain", "loyal", "champion", "stable", "active", "promoter", "low", "new")
+    shift = max(-0.12, min(0.40, eff * 0.5))    # proportional transfer of probability mass
+
+    risk = [i for i in items if any(k in str(i["label"]).lower() for k in _churn_kw)]
+    keep = [i for i in items if any(k in str(i["label"]).lower() for k in _keep_kw)]
+    if risk and keep and abs(shift) > 1e-6:
+        src, dst = (risk, keep) if shift > 0 else (keep, risk)
+        src_mass = sum(i["prob"] for i in src) or 1e-9
+        amt = max(0.0, min(abs(shift), src_mass - 0.02 * len(src)))
+        for i in src:
+            i["prob"] -= amt * (i["prob"] / src_mass)
+        for i in dst:
+            i["prob"] += amt / len(dst)
+    s = sum(i["prob"] for i in items) or 1
+    return [{"label": i["label"], "prob": round(i["prob"] / s, 3)} for i in items]
+
+
+def _realistic_scenario_update(effect: dict, c, time_points: list, seg_lbls: list,
+                               cur_seg, monthly_rev: float, llm_data: dict | None) -> dict:
+    """Build the scenario update, using the AI's curve shape but clamping its
+    magnitude to the data-driven estimate so churn can't be magically zeroed."""
+    base       = float(getattr(c, "churn_score", 0) or 0)
+    proj_final = effect["proj_final"]
+    floor      = effect["floor"]
+    cust_id    = getattr(c, "customer_id", "x")
+
+    code_curve = _project_curve(base, proj_final, time_points, cust_id)
+    proj = None
+    llm_proj = (llm_data or {}).get("projection")
+    if isinstance(llm_proj, list) and len(llm_proj) >= 2:
+        proj = []
+        for i, cp in enumerate(code_curve):
+            lp = llm_proj[i] if i < len(llm_proj) else {}
+            try:
+                lv = float(lp.get("prob", cp["prob"])) if isinstance(lp, dict) else cp["prob"]
+            except (TypeError, ValueError):
+                lv = cp["prob"]
+            # AI may wobble, but stays within ±10pp of the data-driven path and above the floor.
+            v = max(cp["prob"] - 10, min(cp["prob"] + 10, lv))
+            v = max(floor - 5, min(100.0, v))
+            proj.append({"week": cp["week"], "prob": round(v, 2)})
+    if proj is None:
+        proj = code_curve
+    proj[0]["prob"]  = round(base, 2)
+    proj[-1]["prob"] = round(max(0.0, min(100.0, proj_final)), 2)
+
+    final_v = proj[-1]["prob"]
+    mid_v   = proj[len(proj) // 2]["prob"] if len(proj) > 1 else final_v
+    impact  = round(base - final_v, 2)                     # may be ~0 or negative
+    win     = next((p["week"] for p in proj if p["prob"] < 80), time_points[-1] + 1)
+    conf    = round(0.55 + 0.30 * effect["coverage"], 2)
+    seg_mig = _shift_segment_migration(cur_seg, seg_lbls, base, effect["effectiveness"])
+
+    return {
+        "projection":              proj,
+        "intervention_impact_pct": impact,
+        "confidence":              conf,
+        "retention_window_weeks":  win,
+        "revenue_at_risk":         round((monthly_rev or 0) * (mid_v / 100) * 3, 2),
+        "segment_migration":       seg_mig,
+        "effectiveness_pct":       round(effect["effectiveness"] * 100, 1),
+        "drivers_addressed":       effect["matched_drivers"],
+    }
+
+
+def _build_scenario_update_system(effect: dict, horizon_weeks: int) -> str:
+    eff_pct    = round(effect["effectiveness"] * 100)
+    cov_pct    = round(effect["coverage"] * 100)
+    proj_final = effect["proj_final"]
+    matched    = ", ".join(effect["matched_drivers"]) or "none of the customer's main churn drivers"
+    if not effect["has_scenario"]:
+        verdict = "No concrete intervention was specified, so the score should stay essentially flat."
+    elif effect["effectiveness"] < 0:
+        verdict = ("This intervention does not fit what is driving this customer's churn and may "
+                   "slightly INCREASE the risk — do not show an improvement.")
+    elif effect["effectiveness"] <= 0.04:
+        verdict = ("This intervention barely touches the customer's real churn drivers, so the score "
+                   "should move only 0-4 points — essentially flat.")
+    else:
+        verdict = (f"This intervention addresses {cov_pct}% of the customer's churn drivers "
+                   f"({matched}), so a partial, realistic reduction is justified — not a full recovery.")
+    return f"""\
+You are a retention analytics engine grounded in a data-driven effectiveness estimate. Output ONLY valid JSON.
+
+A model has already estimated — from this customer's actual churn drivers, sentiment and history — how well the proposed intervention fits:
+- Estimated effectiveness: {eff_pct}% (0% = no real effect, 100% = maximum realistic turnaround)
+- Churn drivers the scenario actually addresses: {matched}
+- Data-driven projected churn at week {horizon_weeks}: ~{proj_final}
+- Verdict: {verdict}
 
 Schema:
-{
-  "projection": [{"week": 0, "prob": <MUST EQUAL current churn_score>}, {"week": W, "prob": <float>}, ...],
-  "intervention_impact_pct": <float: pp reduction at final week vs baseline>,
+{{
+  "projection": [{{"week": 0, "prob": <MUST EQUAL current churn_score>}}, {{"week": W, "prob": <float>}}, ...],
+  "intervention_impact_pct": <float: current_churn_score - projection_final; may be small, zero, or negative>,
   "confidence": <float 0-1>,
   "retention_window_weeks": <int>,
   "revenue_at_risk": <float: monthly_revenue × midpoint_prob/100 × 3>,
-  "segment_migration": [{"label": "...", "prob": <float>}, ...]
-}
+  "segment_migration": [{{"label": "...", "prob": <float>}}, ...]
+}}
 
-Rules:
+Rules — be realistic, do NOT default to a big drop:
 - projection[0].prob MUST equal the customer's current churn_score exactly.
-- projection values must generally be LOWER than baseline (intervention reduces churn).
-- intervention_impact_pct = baseline_final - projection_final (positive number).
-- segment_migration MUST reflect the intervention effect: shift probability AWAY from high-risk/churned labels and TOWARD retained/loyal labels compared to what the baseline implied. The change must be visible (at least 5-15pp shift across labels). Use the SAME label names as provided in the context.
-- segment_migration probs must sum to exactly 1.0.
-- Match the same weekly time-points as the baseline.
-- Output ONLY the JSON object.
+- The final-week projection MUST land near the data-driven value (~{proj_final}, within a few points). NEVER drive churn to 0 unless the estimate supports it.
+- The curve may dip, plateau, or even rise slightly — reflect the real effect, not a guaranteed decline.
+- If effectiveness is low, the change must be small; an irrelevant intervention leaves churn essentially unchanged.
+- intervention_impact_pct = current_churn_score - projection_final (can be ~0 or negative).
+- segment_migration: shift toward retention ONLY in proportion to the effectiveness above; low effectiveness = barely any shift. Probs MUST sum to exactly 1.0. Use the SAME label names provided.
+- Match the same weekly time-points provided. Output ONLY the JSON object.
 """
 
 
@@ -1736,13 +1999,32 @@ async def simulate(request: SimulateRequest):
 
         # ── MODE: scenario ─────────────────────────────────────────────────
         scenario_block = f"\n\nINTERVENTION SCENARIO: {request.scenario}"
-        agent_ctx = f"{ctx}{scenario_block}{history_block}\n\nProvide your analysis."
+
+        # Compute the data-driven effectiveness FIRST, so every downstream piece —
+        # the agent debate, recommendations, projection, segment migration and the
+        # written summary — is anchored to the SAME estimate and cannot contradict
+        # the chart (e.g. an agent promising -20pp while the trajectory moves -4pp).
+        effect = _estimate_intervention_effect(c, request.scenario, _fallback_points)
+        _matched = ", ".join(effect["matched_drivers"]) or \
+            "none — this lever does not target the customer's main churn drivers"
+        effect_note = (
+            f"\n\nDATA-DRIVEN FIT (model-estimated from this customer's actual churn drivers):"
+            f"\n- Effectiveness: {round(effect['effectiveness']*100)}% "
+            f"(addresses {round(effect['coverage']*100)}% of what is driving churn)"
+            f"\n- Churn drivers actually addressed: {_matched}"
+            f"\n- Projected churn at week {horizon}: ~{effect['proj_final']} "
+            f"(from {c.churn_score:.0f} today)"
+            f"\nGround every number in this estimate — do NOT claim a larger reduction "
+            f"than the data supports; if effectiveness is low, say the impact is limited."
+        )
+        agent_ctx = f"{ctx}{scenario_block}{effect_note}{history_block}\n\nProvide your analysis."
 
         async for evt in _run_agents_parallel(agent_ctx, AGENT_SCENARIO_SYSTEMS):
             yield evt
         agent_outputs_s = getattr(_run_agents_parallel, "_last_outputs", [])
 
-        recs_s = await _extract_recommendations(ctx, agent_outputs_s, scenario=request.scenario,
+        recs_s = await _extract_recommendations(ctx + effect_note, agent_outputs_s,
+            scenario=request.scenario,
             risk_level=c.risk_level, customer_profile={
                 "segment_label": c.segment_label, "plan_type": c.plan_type,
                 "contract_type": c.contract_type, "churn_score": c.churn_score,
@@ -1754,11 +2036,11 @@ async def simulate(request: SimulateRequest):
         yield f"data: {json.dumps({'type': 'thinking'})}\n\n"
 
         debate_text = "\n\n".join(f"[{o['name']}]: {o['content']}" for o in agent_outputs_s)
-        monthly_rev = c.segment_rfm_context.get("total_revenue", {}).get("customer", 0)
+        monthly_rev = (c.segment_rfm_context.get("total_revenue", {}).get("customer", 0) or 0)
         seg_note    = (f"Use segment labels: {seg_lbls}" if seg_lbls
                        else "Use standard labels: Churned, High Risk, At Risk, Retained")
 
-        # Include current baseline segment migration so LLM knows what to shift from
+        # Show the baseline mix the migration will move FROM (proportional, not forced).
         baseline_seg_note = ""
         if request.current_segment_migration:
             seg_lines = ", ".join(
@@ -1766,76 +2048,37 @@ async def simulate(request: SimulateRequest):
                 for s in request.current_segment_migration
                 if isinstance(s, dict)
             )
-            baseline_seg_note = (
-                f"\nBASELINE SEGMENT MIGRATION (pre-intervention): {seg_lines}"
-                f"\nYou MUST shift these probabilities — reduce churn/high-risk by 8-20pp, increase retained/loyal by same amount."
-            )
+            baseline_seg_note = f"\nBASELINE SEGMENT MIGRATION (pre-intervention): {seg_lines}"
 
         synth_user = (
             f"{ctx}{scenario_block}"
             f"\n\nBASELINE TIME POINTS (weeks): {_fallback_points}"
             f"\nMONTHLY REVENUE: ${monthly_rev:,.0f}"
+            f"\nDATA-DRIVEN EFFECTIVENESS ESTIMATE: {round(effect['effectiveness']*100)}% "
+            f"(addresses {round(effect['coverage']*100)}% of churn drivers; "
+            f"projected final churn ~{effect['proj_final']})"
             f"\n{seg_note}{baseline_seg_note}"
             f"\n\nMULTI-AGENT DEBATE:\n{debate_text}"
             f"\n\nGenerate the scenario update JSON now."
         )
 
-        update_data: dict = {}
+        llm_data: dict | None = None
+        _sim_err: str | None   = None
         try:
-            raw         = await call_llm(_SCENARIO_UPDATE_JSON_SYSTEM, synth_user, max_tokens=1000)
-            update_data = _extract_json(raw)
-            if update_data.get("projection"):
-                update_data["projection"][0]["prob"] = round(c.churn_score, 2)
+            raw      = await call_llm(_build_scenario_update_system(effect, horizon),
+                                      synth_user, max_tokens=1000)
+            llm_data = _extract_json(raw)
         except Exception as exc:
-            # Build a fallback segment_migration shifted toward retention
-            _cur_seg = request.current_segment_migration or []
-            if _cur_seg and len(_cur_seg) >= 2:
-                # Shift 15pp from churn/high-risk labels toward retained/loyal labels
-                _shift    = 0.15
-                _churn_kw = {"churned", "risk", "critical", "danger", "high"}
-                _keep_kw  = {"retained", "loyal", "champion", "stable", "active"}
-                _new_seg  = []
-                _total    = sum(s.get("prob", 0) for s in _cur_seg) or 1.0
-                for s in _cur_seg:
-                    lbl  = str(s.get("label", "")).lower()
-                    prob = s.get("prob", 0) / _total
-                    if any(k in lbl for k in _churn_kw):
-                        prob = max(0.02, prob - _shift / len(_cur_seg) * 2)
-                    elif any(k in lbl for k in _keep_kw):
-                        prob = min(0.95, prob + _shift / len(_cur_seg) * 2)
-                    _new_seg.append({"label": s["label"], "prob": round(prob, 3)})
-                _norm = sum(x["prob"] for x in _new_seg) or 1
-                _fallback_seg_mig = [{"label": x["label"], "prob": round(x["prob"] / _norm, 3)} for x in _new_seg]
-            elif seg_lbls and len(seg_lbls) >= 2:
-                n = len(seg_lbls)
-                base = c.churn_score / 100
-                probs = [max(0.02, base * 0.5 / max(n-1,1) * (n-1-i) + (1-base) * 0.4 / max(n-1,1) * i) for i in range(n)]
-                tot = sum(probs) or 1
-                _fallback_seg_mig = [{"label": seg_lbls[i], "prob": round(probs[i]/tot, 3)} for i in range(n)]
-            else:
-                base = c.churn_score / 100
-                _fallback_seg_mig = [
-                    {"label": "Churned",   "prob": round(max(0.02, base * 0.45), 3)},
-                    {"label": "High Risk", "prob": round(base * 0.15, 3)},
-                    {"label": "At Risk",   "prob": round((1-base) * 0.35, 3)},
-                    {"label": "Retained",  "prob": round((1-base) * 0.60, 3)},
-                ]
-                _tot = sum(x["prob"] for x in _fallback_seg_mig) or 1
-                _fallback_seg_mig = [{"label": x["label"], "prob": round(x["prob"]/_tot, 3)} for x in _fallback_seg_mig]
+            _sim_err = str(exc)[:120]
 
-            update_data = {
-                "projection": [
-                    {"week": w, "prob": round(min(100, c.churn_score * (0.70 ** (1 + i * 0.15))), 2)}
-                    for i, w in enumerate(_fallback_points)
-                ],
-                "intervention_impact_pct": 30.0,
-                "confidence":              0.55,
-                "retention_window_weeks":  min(horizon + 1, 8),
-                "revenue_at_risk":         round(monthly_rev * (c.churn_score * 0.65 / 100) * 3, 2),
-                "segment_migration":       _fallback_seg_mig,
-                "_error": str(exc)[:120],
-            }
-            update_data["projection"][0]["prob"] = round(c.churn_score, 2)
+        # Clamp the AI output to the data-driven estimate (or build it outright if the
+        # AI failed). Guarantees a realistic, non-misleading trajectory & migration.
+        update_data = _realistic_scenario_update(
+            effect, c, _fallback_points, seg_lbls,
+            request.current_segment_migration, monthly_rev, llm_data,
+        )
+        if _sim_err:
+            update_data["_error"] = _sim_err
 
         yield f"data: {json.dumps({'type': 'data', 'payload': update_data})}\n\n"
 
